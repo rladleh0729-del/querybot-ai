@@ -1,0 +1,15 @@
+# Render 무료 서버는 15분 동안 요청이 없으면 잠든다 → 5분마다 한 번 불러서 깨워 둔다.
+# (GitHub 예약 실행은 몇 분씩 늦어질 수 있어서 15분보다 넉넉히 짧게 잡았다.)
+# 주의: 공개 저장소는 60일 동안 커밋이 없으면 GitHub가 예약 실행을 멈춘다 → Actions 탭에서 다시 켜기.
+name: keep-awake
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: ping server
+        run: curl -s -o /dev/null -w "%{http_code}\n" --max-time 100 --retry 2 https://querybot-ai.onrender.com/state || true
