@@ -167,6 +167,7 @@ async def root():
 
 
 @app.get("/health")
+@app.get("/state")  # 광고 차단 목록(Brave 실드 등)이 다른 사이트의 /health 요청을 막아서, 페이지는 이 주소를 쓴다
 async def health():
     # async라 답 만드는 작업이 밀려 있어도 바로 응답한다 (켜져 있는데 '꺼짐'으로 보이지 않게).
     return {"ok": True, "model": MODEL_INFO}
