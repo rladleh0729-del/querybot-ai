@@ -126,10 +126,15 @@ def load_model(ckpt_path):
     else:
         source = ckpt_path
     ckpt = torch.load(source, map_location="cpu", weights_only=False)
-    model = GPTLanguageModel(ModelConfig(**ckpt["model_config"]))
-    state = {k: v.float() for k, v in ckpt["model_state_dict"].items()}
+    del source
+    # Render 무료(메모리 512MB)에서 버티려고 메모리를 아낀다:
+    # 빈 껍데기(meta)로 모델을 만들고 불러온 가중치를 그대로 끼운다 (무작위 초기값용 메모리를 따로 안 씀).
+    with torch.device("meta"):
+        model = GPTLanguageModel(ModelConfig(**ckpt["model_config"]))
     # 학습기의 옛 방식(F.scaled_dot_product_attention이 없을 때)에서만 생기는 가림막 버퍼는 필요 없다.
-    state = {k: v for k, v in state.items() if not k.endswith("causal_mask")}
-    model.load_state_dict(state)
+    state = {k: v.float() for k, v in ckpt.pop("model_state_dict").items() if not k.endswith("causal_mask")}
+    model.load_state_dict(state, assign=True)
+    del state
+    model.lm_head.weight = model.transformer["wte"].weight  # 끼우면서 풀린 입력·출력 가중치 공유를 다시 묶는다
     model.eval()
     return model, ckpt
