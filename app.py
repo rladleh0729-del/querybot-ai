@@ -15,6 +15,7 @@ PyTorch 대신 numpy로 모델을 돌린다(np_model.py) — Render 무료 메�
 """
 import gc
 import os
+import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -165,6 +166,14 @@ def build_prompt(m: Loaded, history: list, text: str):
     return ids, (len(turns) - 1) // 2
 
 
+# 토크나이저가 영어를 소문자로 바꿔서 모델은 'ai'로만 쓴다 → 내보낼 때 'AI'로 (2026-10-19 사용자 요청)
+AI_WORD = re.compile(r"(?<![A-Za-z])ai(?![A-Za-z])")
+
+
+def fix_ai(text: str) -> str:
+    return AI_WORD.sub("AI", text)
+
+
 def make_reply(m: Loaded, history: list, text: str):
     ids, kept = build_prompt(m, history, text)
     banned = banned_ids(m.sp, text)  # 사용자 말에 숫자가 없으면 숫자로 새는 답과 깨진 글자를 막는다
@@ -177,7 +186,7 @@ def make_reply(m: Loaded, history: list, text: str):
                 break
             new.append(token)
             logits, past = m.model([token], past)
-    return m.sp.decode(new).strip() or "...", kept
+    return fix_ai(m.sp.decode(new).strip()) or "...", kept
 
 
 # =========================================================
