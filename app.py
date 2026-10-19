@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from ai_sampling import pick_next, space_id_of
+from ai_sampling import banned_ids, pick_next, space_id_of
 from model import load_model
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -39,7 +39,7 @@ MAX_INPUT_CHARS = 200
 MAX_BODY_BYTES = 4096    # 요청 본문 상한 (200자 한글 JSON은 1KB 안팎)
 MAX_NEW_TOKENS = 120     # 정상 답은 대개 짧지만, 2~3문장 답이 잘리지 않게 넉넉히
 MAX_IN_FLIGHT = 3        # 답 만드는 중 1개 + 기다리는 2개까지. 넘치면 바로 "잠시 후"
-TEMPERATURE = 0.7
+TEMPERATURE = 0.6       # 평가(2026-10-19)에서 0.5~0.6이 0.7보다 조금 나았음
 TOP_K = 40
 REPETITION = 1.1         # 반복 벌점 (약하게. 세면 조사·어미가 망가짐)
 NO_REPEAT_NGRAM = 3      # 이번 답에 나온 3조각 묶음은 다시 못 씀
@@ -95,11 +95,12 @@ def make_reply(text: str) -> str:
     # 질문 부분만 잘라서 머리말·꼬리말(학습 때 형식)은 항상 남긴다. 질문+답이 block_size를 넘지 않는다.
     budget = model.config.block_size - MAX_NEW_TOKENS - len(PROMPT_HEAD) - len(PROMPT_TAIL)
     ids = PROMPT_HEAD + sp.encode(text, out_type=int)[:budget] + PROMPT_TAIL
+    banned = banned_ids(sp, text)  # 사용자 말에 숫자가 없으면 숫자로 새는 답과 깨진 글자를 막는다
     new = []
     with generate_lock, torch.inference_mode():
         logits, past = model(torch.tensor([ids], dtype=torch.long))
         for step in range(MAX_NEW_TOKENS):
-            nxt = pick_next(logits, step, new, SPACE_ID, TEMPERATURE, TOP_K, REPETITION, NO_REPEAT_NGRAM)
+            nxt = pick_next(logits, step, new, SPACE_ID, TEMPERATURE, TOP_K, REPETITION, NO_REPEAT_NGRAM, banned)
             token = int(nxt.item())
             if token in STOP_IDS:
                 break
