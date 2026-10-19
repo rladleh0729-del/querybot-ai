@@ -2,12 +2,13 @@
 
 PC판(ai_server.py)과 같은 일을 하지만 ngrok 없이 클라우드(Render)에서 24시간 돈다.
 포트는 환경변수 PORT를 따르고(Render), 없으면 7860.
+PyTorch 대신 numpy로 모델을 돌린다(np_model.py) — Render 무료 메모리 512MB에서 PyTorch는 혼자 350MB를 넘게 먹는다.
 
 모델 파일 (PC에서는 model_files/ 안, GitHub에서는 app.py 옆 — 웹 업로드는 폴더를 못 만들어서):
-  model.pt.part01, 02 ...         ← 기본(최신) 모델. make_cloud_model.py로 줄여서 9MB씩 자른 체크포인트
+  model.npz.part01, 02 ...        ← 기본(최신) 모델. make_cloud_model.py로 바꿔서 9MB씩 자른 가중치
   spm_small_chat_gpt.model        ← 기본 모델의 토크나이저
-  <이름>.model.pt.part01 ...      ← 방문자가 골라 볼 수 있는 다른 모델 (EXTRA_MODELS)
-  <이름>.spm.model                   (make_cloud_model.py --prefix <이름> --int8)
+  <이름>.model.npz.part01 ...     ← 방문자가 골라 볼 수 있는 다른 모델 (EXTRA_MODELS)
+  <이름>.spm.model                   (make_cloud_model.py --prefix <이름>)
 
 방문자는 모델을 고르고, '이전 대화 기억'을 켜면 앞 대화(history)를 같이 보낸다.
 서버는 대화를 저장하지 않는다 — 페이지가 들고 있다가 매번 보낸다.
@@ -20,31 +21,27 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 import sentencepiece as spm
-import torch
-import torch.nn as nn
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from ai_sampling import banned_ids, pick_next, space_id_of
-from model import load_model
+from np_model import NPModel
+from np_sampling import banned_ids, pick_next, space_id_of
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = Path(os.environ.get("AI_MODEL_DIR", str(
     BASE_DIR / "model_files" if (BASE_DIR / "model_files").is_dir() else BASE_DIR)))
 
 # 고를 수 있는 다른 모델: (키, 이름, 파일 앞머리). 기본 모델은 "latest".
-# Render 무료(메모리 512MB)에 같이 들어가도록 처음 고를 때 불러온다. 파일은 PC에서 미리 8비트로
-# 줄여 둔다(make_cloud_model.py --int8, 답은 거의 같음). 안 줄인 파일이면 불러온 뒤 줄인다.
+# Render 무료(메모리 512MB)에 맞추려고 처음 고를 때 불러오고, 한 번에 하나만 올려 둔다.
 EXTRA_MODELS = [
     ("stage3", "3단계 모델", "stage3"),
     ("v1", "첫 모델 (1,380만)", "v1"),
 ]
 
 PORT = int(os.environ.get("PORT", "7860"))
-torch.set_num_threads(max(1, int(os.environ.get("AI_CPU_THREADS", str(os.cpu_count() or 1)))))
 
 MAX_INPUT_CHARS = 200
 MAX_HISTORY = 20         # 앞 대화는 최근 20개(10번 주고받기)까지만 받는다
@@ -81,8 +78,8 @@ def log(msg: str) -> None:
 def model_files(prefix: str):
     """(체크포인트 경로, 토크나이저 경로). 기본 모델은 앞머리가 없다."""
     if prefix:
-        return MODEL_DIR / f"{prefix}.model.pt", MODEL_DIR / f"{prefix}.spm.model"
-    return MODEL_DIR / "model.pt", MODEL_DIR / "spm_small_chat_gpt.model"
+        return MODEL_DIR / f"{prefix}.model.npz", MODEL_DIR / f"{prefix}.spm.model"
+    return MODEL_DIR / "model.npz", MODEL_DIR / "spm_small_chat_gpt.model"
 
 
 def has_files(prefix: str) -> bool:
@@ -91,23 +88,19 @@ def has_files(prefix: str) -> bool:
 
 
 class Loaded:
-    def __init__(self, prefix: str, quantize: bool):
-        ckpt_path, spm_path = model_files(prefix)
+    def __init__(self, prefix: str):
+        npz_path, spm_path = model_files(prefix)
         self.sp = spm.SentencePieceProcessor()
         self.sp.load(str(spm_path))
-        model, ckpt = load_model(ckpt_path)
-        pre_quantized = "params" in ckpt  # make_cloud_model.py --int8 로 미리 줄인 모델
-        self.block_size = model.config.block_size
+        self.model = NPModel(npz_path)
+        meta = self.model.meta
+        self.block_size = self.model.block_size
         self.info = {
-            "params": int(ckpt["params"]) if pre_quantized else sum(p.numel() for p in model.parameters()),
-            "iter": int(ckpt.get("iter_num", 0)),
-            "val_loss": round(float(ckpt.get("best_val_loss", 0.0)), 3),
-            "saved_at": ckpt.get("saved_at", ""),
+            "params": self.model.params,
+            "iter": int(meta.get("iter_num", 0)),
+            "val_loss": round(float(meta.get("best_val_loss", 0.0)), 3),
+            "saved_at": meta.get("saved_at", ""),
         }
-        del ckpt
-        if quantize and not pre_quantized:
-            model = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
-        self.model = model
         unk = self.sp.unk_id()
         self.stops = {i for i in (self.sp.piece_to_id(s) for s in SPECIALS) if i != unk}
         self.space_id = space_id_of(self.sp)  # 첫 토큰 빈칸 막기용 (ai_sampling.py 설명 참고)
@@ -115,7 +108,7 @@ class Loaded:
 
 if not has_files(""):
     raise SystemExit(f"기본 모델 파일이 없음: {MODEL_DIR}")
-loaded = {"latest": Loaded("", quantize=False)}
+loaded = {"latest": Loaded("")}
 gc.collect()
 log(f"기본 모델 준비: {loaded['latest'].info}")
 CHOICES = [("latest", "최신 모델", "")] + [m for m in EXTRA_MODELS if has_files(m[2])]
@@ -144,7 +137,7 @@ def get_model(key: str) -> Loaded:
                     del loaded[other]
                 gc.collect()
             t0 = time.time()
-            loaded[key] = Loaded(prefix, quantize=True)
+            loaded[key] = Loaded(prefix)
             gc.collect()
             log(f"모델 불러옴: {key} ({time.time() - t0:.1f}초) {loaded[key].info} 메모리 {memory_mb()}")
         return loaded[key]
@@ -176,15 +169,14 @@ def make_reply(m: Loaded, history: list, text: str):
     ids, kept = build_prompt(m, history, text)
     banned = banned_ids(m.sp, text)  # 사용자 말에 숫자가 없으면 숫자로 새는 답과 깨진 글자를 막는다
     new = []
-    with generate_lock, torch.inference_mode():
-        logits, past = m.model(torch.tensor([ids], dtype=torch.long))
+    with generate_lock:
+        logits, past = m.model(ids)
         for step in range(MAX_NEW_TOKENS):
-            nxt = pick_next(logits, step, new, m.space_id, TEMPERATURE, TOP_K, REPETITION, NO_REPEAT_NGRAM, banned)
-            token = int(nxt.item())
+            token = pick_next(logits, step, new, m.space_id, TEMPERATURE, TOP_K, REPETITION, NO_REPEAT_NGRAM, banned)
             if token in m.stops:
                 break
             new.append(token)
-            logits, past = m.model(nxt.view(1, 1), past)
+            logits, past = m.model([token], past)
     return m.sp.decode(new).strip() or "...", kept
 
 

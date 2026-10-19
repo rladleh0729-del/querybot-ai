@@ -13,5 +13,7 @@ USER user
 ENV PYTHONUNBUFFERED=1
 # 메모리 할당 구역을 줄여서 Render 무료(512MB) 안에서 버티게 한다
 ENV MALLOC_ARENA_MAX=2
+# CPU가 0.1개뿐이라 행렬 계산 스레드는 하나로 (스레드마다 잡는 메모리도 아낌)
+ENV OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 EXPOSE 7860
 CMD ["python", "app.py"]

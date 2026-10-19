@@ -1,0 +1,7 @@
+# 예전 PyTorch용 모델 조각과 PC 전용 파일은 서버 이미지에 넣지 않는다
+*.pt.part*
+model.py
+ai_sampling.py
+make_cloud_model.py
+model_files_old
+__pycache__
