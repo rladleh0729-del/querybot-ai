@@ -127,6 +127,12 @@ def load_model(ckpt_path):
         source = ckpt_path
     ckpt = torch.load(source, map_location="cpu", weights_only=False)
     del source
+    if "quantized_model" in ckpt:
+        # make_cloud_model.py --int8 로 PC에서 미리 8비트로 줄여 둔 모델: 그대로 쓴다
+        # (서버에서 줄이면 줄이는 동안 float32 사본이 잠깐 생겨 메모리가 튄다).
+        model = ckpt.pop("quantized_model")
+        model.eval()
+        return model, ckpt
     # Render 무료(메모리 512MB)에서 버티려고 메모리를 아낀다:
     # 빈 껍데기(meta)로 모델을 만들고 불러온 가중치를 그대로 끼운다 (무작위 초기값용 메모리를 따로 안 씀).
     with torch.device("meta"):
