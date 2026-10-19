@@ -11,5 +11,7 @@ COPY --chown=user . .
 USER user
 
 ENV PYTHONUNBUFFERED=1
+# 메모리 할당 구역을 줄여서 Render 무료(512MB) 안에서 버티게 한다
+ENV MALLOC_ARENA_MAX=2
 EXPOSE 7860
 CMD ["python", "app.py"]

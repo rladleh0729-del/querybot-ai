@@ -12,6 +12,7 @@ PC판(ai_server.py)과 같은 일을 하지만 ngrok 없이 클라우드(Render)
 방문자는 모델을 고르고, '이전 대화 기억'을 켜면 앞 대화(history)를 같이 보낸다.
 서버는 대화를 저장하지 않는다 — 페이지가 들고 있다가 매번 보낸다.
 """
+import gc
 import os
 import threading
 import time
@@ -115,9 +116,20 @@ class Loaded:
 if not has_files(""):
     raise SystemExit(f"기본 모델 파일이 없음: {MODEL_DIR}")
 loaded = {"latest": Loaded("", quantize=False)}
+gc.collect()
 log(f"기본 모델 준비: {loaded['latest'].info}")
 CHOICES = [("latest", "최신 모델", "")] + [m for m in EXTRA_MODELS if has_files(m[2])]
 load_lock = threading.Lock()
+
+
+def memory_mb() -> dict:
+    """지금·최대 메모리(MB). Render 무료는 메모리 그래프를 안 보여 줘서 /state로 직접 본다 (리눅스에서만)."""
+    try:
+        status = Path("/proc/self/status").read_text()
+        val = lambda key: int(next(l.split()[1] for l in status.splitlines() if l.startswith(key))) // 1024  # noqa: E731
+        return {"rss": val("VmRSS:"), "peak": val("VmHWM:")}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def get_model(key: str) -> Loaded:
@@ -126,9 +138,15 @@ def get_model(key: str) -> Loaded:
             prefix = next((p for k, _, p in CHOICES if k == key), None)
             if prefix is None:
                 raise HTTPException(status_code=400, detail="없는 모델")
+            # 512MB에 맞추려고 다른 모델은 한 번에 하나만 올려 둔다 (기본 모델은 항상 유지).
+            with generate_lock:
+                for other in [k for k in loaded if k != "latest"]:
+                    del loaded[other]
+                gc.collect()
             t0 = time.time()
             loaded[key] = Loaded(prefix, quantize=True)
-            log(f"모델 불러옴: {key} ({time.time() - t0:.1f}초) {loaded[key].info}")
+            gc.collect()
+            log(f"모델 불러옴: {key} ({time.time() - t0:.1f}초) {loaded[key].info} 메모리 {memory_mb()}")
         return loaded[key]
 
 
@@ -249,7 +267,7 @@ async def root():
 @app.get("/state")  # 광고 차단 목록(Brave 실드 등)이 다른 사이트의 /health 요청을 막아서, 페이지는 이 주소를 쓴다
 async def health():
     # async라 답 만드는 작업이 밀려 있어도 바로 응답한다 (켜져 있는데 '꺼짐'으로 보이지 않게).
-    return {"ok": True, "model": loaded["latest"].info, "models": model_list()}
+    return {"ok": True, "model": loaded["latest"].info, "models": model_list(), "memory_mb": memory_mb()}
 
 
 @app.post("/chat")
