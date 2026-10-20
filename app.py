@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from np_model import NPModel
 from np_sampling import banned_ids, pick_next, space_id_of
+import wiki_search  # 지식 질문은 위키백과에서 찾아 답함 (2026-10-20)
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = Path(os.environ.get("AI_MODEL_DIR", str(
@@ -286,12 +287,19 @@ def chat(body: ChatIn, request: Request):
         raise HTTPException(status_code=429, detail="잠시 후 다시 시도")
     try:
         t0 = time.time()
-        m = get_model(body.model)
-        reply, kept = make_reply(m, body.history, text)
+        wiki = wiki_search.lookup(text)  # 지식 질문 → 위키백과 요약(+출처)
+        if wiki:
+            reply, kept = wiki["reply"], 0
+        else:
+            m = get_model(body.model)
+            reply, kept = make_reply(m, body.history, text)
     finally:
         in_flight.release()
-    log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자 ({time.time() - t0:.1f}초)")
-    return {"reply": reply, "kept_turns": kept}
+    log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{' (위키백과)' if wiki else ''} ({time.time() - t0:.1f}초)")
+    out = {"reply": reply, "kept_turns": kept}
+    if wiki:
+        out["source"] = wiki["url"]
+    return out
 
 
 if __name__ == "__main__":
