@@ -14,10 +14,12 @@ PyTorch 대신 numpy로 모델을 돌린다(np_model.py) — Render 무료 메�
 서버는 대화를 저장하지 않는다 — 페이지가 들고 있다가 매번 보낸다.
 """
 import gc
+import json
 import os
 import re
 import threading
 import time
+import urllib.request
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -47,6 +49,10 @@ PORT = int(os.environ.get("PORT", "7860"))
 
 MAX_INPUT_CHARS = 200
 MAX_HISTORY = 20         # 앞 대화는 최근 20개(10번 주고받기)까지만 받는다
+PROMPT_HISTORY = 4       # 그중 모델에 넣는 건 최근 2번 주고받은 것만 (작은 모델은 앞 대화가 길면 헷갈림, 2026-10-21)
+# 주인이 사이트 '가르치기 모드'로 가르친 대화(PC 답변 서버에 저장)를 몇 분마다 받아 와서, 같은 말엔 바로 그 답을 한다.
+TEACH_PAIRS_URL = os.environ.get("TEACH_PAIRS_URL", "https://poem-defog-septum.ngrok-free.dev/teach/pairs")
+TEACH_REFRESH_SEC = 300
 MAX_BODY_BYTES = 16384   # 요청 본문 상한 (질문 200자 + 앞 대화 20개)
 MAX_NEW_TOKENS = 120     # 정상 답은 대개 짧지만, 2~3문장 답이 잘리지 않게 넉넉히
 MAX_IN_FLIGHT = 3        # 답 만드는 중 1개 + 기다리는 2개까지. 넘치면 바로 "잠시 후"
@@ -153,7 +159,10 @@ def build_prompt(m: Loaded, history: list, text: str):
     """학습 때와 같은 형식으로 앞 대화를 붙인다. 길면 오래된 대화부터 뺀다 (PC 시험 페이지와 같은 방식)."""
     sp = m.sp
     budget = m.block_size - MAX_NEW_TOKENS
-    turns = [(t.role, " ".join(t.content.split())) for t in history if t.content.strip()] + [("user", text)]
+    recent = history[-PROMPT_HISTORY:] if PROMPT_HISTORY else []
+    if recent and recent[0].role != "user":  # 사용자 말부터 시작하게
+        recent = recent[1:]
+    turns = [(t.role, " ".join(t.content.split())) for t in recent if t.content.strip()] + [("user", text)]
     while True:
         body = "\n".join(f"<|{role}|>\n{content}" for role, content in turns)
         ids = sp.encode(f"<|document_start|>\n{body}\n<|assistant|>\n", out_type=int)
@@ -173,6 +182,43 @@ AI_WORD = re.compile(r"(?<![A-Za-z])ai(?![A-Za-z])")
 
 def fix_ai(text: str) -> str:
     return AI_WORD.sub("AI", text)
+
+
+# =========================================================
+# 가르친 대화 (PC 답변 서버의 /teach/pairs를 몇 분마다 받아 옴. PC가 꺼져 있으면 마지막으로 받은 것을 계속 씀)
+# =========================================================
+_TEACH_PUNCT = re.compile(r"[\s.,!?~…ㅠㅜ\"'()\[\]{}:;·\-]+")
+taught: dict = {}
+taught_info = {"count": 0, "updated": ""}
+
+
+def teach_norm(text: str) -> str:
+    """같은 말인지 비교용: 띄어쓰기·문장 부호를 빼고 소문자로 (PC teach_store.norm과 같게)."""
+    return _TEACH_PUNCT.sub("", text).lower()
+
+
+def refresh_taught() -> None:
+    while True:
+        try:
+            req = urllib.request.Request(TEACH_PAIRS_URL, headers={
+                "User-Agent": "QueryBotAI/1.0 (https://querybot.kr/ai)", "ngrok-skip-browser-warning": "1"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            new = {}
+            for p in data.get("pairs", []):
+                q, a = str(p.get("q", "")), str(p.get("a", ""))
+                if q and a and len(q) <= MAX_INPUT_CHARS and len(a) <= MAX_INPUT_CHARS:
+                    new[teach_norm(q)] = a  # 나중에 가르친 것이 앞의 것을 덮는다
+            taught.clear()
+            taught.update(new)
+            taught_info.update(count=len(new), updated=time.strftime("%Y-%m-%d %H:%M"))
+        except Exception as exc:  # noqa: BLE001 — PC가 꺼져 있으면 실패, 그냥 다음에 다시
+            log(f"가르친 대화 받기 실패(PC 꺼짐?): {type(exc).__name__}")
+        time.sleep(TEACH_REFRESH_SEC)
+
+
+if TEACH_PAIRS_URL:
+    threading.Thread(target=refresh_taught, daemon=True).start()
 
 
 def make_reply(m: Loaded, history: list, text: str):
@@ -269,7 +315,7 @@ async def root():
 @app.get("/state")  # 광고 차단 목록(Brave 실드 등)이 다른 사이트의 /health 요청을 막아서, 페이지는 이 주소를 쓴다
 async def health():
     # async라 답 만드는 작업이 밀려 있어도 바로 응답한다 (켜져 있는데 '꺼짐'으로 보이지 않게).
-    return {"ok": True, "model": loaded["latest"].info, "models": model_list(), "memory_mb": memory_mb()}
+    return {"ok": True, "model": loaded["latest"].info, "models": model_list(), "memory_mb": memory_mb(), "taught": taught_info}
 
 
 @app.post("/chat")
@@ -287,16 +333,23 @@ def chat(body: ChatIn, request: Request):
         raise HTTPException(status_code=429, detail="잠시 후 다시 시도")
     try:
         t0 = time.time()
-        wiki = wiki_search.lookup(text)  # 지식 질문 → 위키백과 요약(+출처)
-        if wiki:
+        # 기본 모델로 대화할 때만: 주인이 가르친 말이면 그 답을 바로 (다른 모델을 고른 방문자에겐 그 모델 답 그대로)
+        answer = taught.get(teach_norm(text)) if body.model == "latest" else None
+        wiki = None if answer else wiki_search.lookup(text)  # 지식 질문 → 위키백과 요약(+출처)
+        if answer:
+            reply, kept = answer, 0
+        elif wiki:
             reply, kept = wiki["reply"], 0
         else:
             m = get_model(body.model)
             reply, kept = make_reply(m, body.history, text)
     finally:
         in_flight.release()
-    log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{' (위키백과)' if wiki else ''} ({time.time() - t0:.1f}초)")
+    kind = " (가르친 답)" if answer else " (위키백과)" if wiki else ""
+    log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{kind} ({time.time() - t0:.1f}초)")
     out = {"reply": reply, "kept_turns": kept}
+    if answer:
+        out["taught"] = True
     if wiki:
         out["source"] = wiki["url"]
     return out
