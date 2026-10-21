@@ -73,7 +73,7 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:8000",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
-]
+] + [o for o in os.environ.get("AI_EXTRA_ORIGINS", "").split(",") if o]  # 시험할 때만
 
 
 def log(msg: str) -> None:
@@ -189,7 +189,7 @@ def fix_ai(text: str) -> str:
 # =========================================================
 _TEACH_PUNCT = re.compile(r"[\s.,!?~…ㅠㅜ\"'()\[\]{}:;·\-]+")
 taught: dict = {}
-taught_info = {"count": 0, "updated": ""}
+taught_info = {"count": 0, "updated": "", "at": 0.0}
 
 
 def teach_norm(text: str) -> str:
@@ -197,8 +197,12 @@ def teach_norm(text: str) -> str:
     return _TEACH_PUNCT.sub("", text).lower()
 
 
-def refresh_taught() -> None:
-    while True:
+taught_lock = threading.Lock()
+
+
+def load_taught() -> bool:
+    """PC 답변 서버에서 가르친 대화를 받아 온다. 성공하면 True (PC가 꺼져 있으면 False, 지난 것 그대로)."""
+    with taught_lock:
         try:
             req = urllib.request.Request(TEACH_PAIRS_URL, headers={
                 "User-Agent": "QueryBotAI/1.0 (https://querybot.kr/ai)", "ngrok-skip-browser-warning": "1"})
@@ -211,9 +215,16 @@ def refresh_taught() -> None:
                     new[teach_norm(q)] = a  # 나중에 가르친 것이 앞의 것을 덮는다
             taught.clear()
             taught.update(new)
-            taught_info.update(count=len(new), updated=time.strftime("%Y-%m-%d %H:%M"))
-        except Exception as exc:  # noqa: BLE001 — PC가 꺼져 있으면 실패, 그냥 다음에 다시
+            taught_info.update(count=len(new), updated=time.strftime("%Y-%m-%d %H:%M:%S"), at=time.time())
+            return True
+        except Exception as exc:  # noqa: BLE001 — PC가 꺼져 있으면 실패
             log(f"가르친 대화 받기 실패(PC 꺼짐?): {type(exc).__name__}")
+            return False
+
+
+def refresh_taught() -> None:
+    while True:
+        load_taught()
         time.sleep(TEACH_REFRESH_SEC)
 
 
@@ -315,7 +326,24 @@ async def root():
 @app.get("/state")  # 광고 차단 목록(Brave 실드 등)이 다른 사이트의 /health 요청을 막아서, 페이지는 이 주소를 쓴다
 async def health():
     # async라 답 만드는 작업이 밀려 있어도 바로 응답한다 (켜져 있는데 '꺼짐'으로 보이지 않게).
-    return {"ok": True, "model": loaded["latest"].info, "models": model_list(), "memory_mb": memory_mb(), "taught": taught_info}
+    return {"ok": True, "model": loaded["latest"].info, "models": model_list(), "memory_mb": memory_mb(),
+            "taught": {"count": taught_info["count"], "updated": taught_info["updated"]}}
+
+
+@app.get("/taught")
+async def taught_list():
+    # 이 사이트 서버가 지금 바로 답하는 데 쓰는 가르친 대화 (주인 페이지가 '사이트 반영됨'을 표시하는 데 씀)
+    return {"updated": taught_info["updated"], "count": taught_info["count"],
+            "items": [{"q": k, "a": v} for k, v in taught.items()]}
+
+
+@app.post("/taught/refresh")
+def taught_refresh(request: Request):
+    # 주인이 가르친 직후 페이지가 부른다 → 5분을 기다리지 않고 바로 받아 옴 (너무 자주는 안 받음)
+    check_rate_limit(client_ip(request))
+    if time.time() - taught_info.get("at", 0) > 10:
+        load_taught()
+    return {"updated": taught_info["updated"], "count": taught_info["count"]}
 
 
 @app.post("/chat")
