@@ -67,6 +67,16 @@ def _search(query: str, n: int = 3) -> list:
     return [h["title"] for h in _get(f"{API}?{q}").get("query", {}).get("search", [])]
 
 
+def _exact(name: str):
+    """이름이 문서 제목이거나 넘겨주기(별명)면 실제 문서 제목 — AI → 인공지능, NASA → 미국 항공 우주국. 없거나 동음이의어 문서면 None."""
+    q = urllib.parse.urlencode({"action": "query", "titles": name, "redirects": 1, "prop": "pageprops",
+                                "ppprop": "disambiguation", "format": "json", "utf8": 1})
+    for p in _get(f"{API}?{q}").get("query", {}).get("pages", {}).values():
+        if "missing" not in p and "invalid" not in p and "pageprops" not in p:
+            return p["title"]
+    return None
+
+
 def _summary(title: str):
     d = _get(REST + urllib.parse.quote(title.replace(" ", "_"), safe=""))
     if d.get("type") == "disambiguation" or not d.get("extract"):
@@ -116,6 +126,13 @@ def _lookup(kind: str, e: str):
                 if "수도" in sent:
                     return s[0], sent, s[2]
         return None
+    # 줄임말·다른 이름은 위키백과 넘겨주기로 먼저 찾는다 ("ai"처럼 소문자로 물어도 되게 대문자도 한 번)
+    for name in dict.fromkeys([e, e.upper()] if re.fullmatch(r"[A-Za-z]+", e) else [e]):
+        title = _exact(name)
+        if title:
+            s = _summary(title)
+            if s and not s[1].lstrip().startswith("《"):
+                return s
     ne = _norm(e)
     for title in _search(e):
         nt = _norm(re.sub(r"\s*\(.*\)$", "", title))  # "파리 (프랑스)" → "파리"
