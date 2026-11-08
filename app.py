@@ -331,8 +331,11 @@ async def root():
 @app.get("/state")  # 광고 차단 목록(Brave 실드 등)이 다른 사이트의 /health 요청을 막아서, 페이지는 이 주소를 쓴다
 async def health():
     # async라 답 만드는 작업이 밀려 있어도 바로 응답한다 (켜져 있는데 '꺼짐'으로 보이지 않게).
-    return {"ok": True, "model": loaded["latest"].info, "models": model_list(), "memory_mb": memory_mb(),
-            "taught": {"count": taught_info["count"], "updated": taught_info["updated"]}}
+    out = {"ok": True, "model": loaded["latest"].info, "models": model_list(), "memory_mb": memory_mb(),
+           "taught": {"count": taught_info["count"], "updated": taught_info["updated"]}}
+    if cf_chat.ready():
+        out["quota"] = cf_chat.usage()  # Gemma 4 오늘 남은 뉴런 (무료 하루 10,000, 한국 오전 9시 초기화)
+    return out
 
 
 @app.get("/taught")
@@ -368,7 +371,8 @@ def chat(body: ChatIn, request: Request):
         t0 = time.time()
         # 기본 모델로 대화할 때만: 주인이 가르친 말이면 그 답을 바로 (다른 모델을 고른 방문자에겐 그 모델 답 그대로)
         answer = taught.get(teach_norm(text)) if body.model == "latest" else None
-        wiki = None if answer else wiki_search.lookup(text)  # 지식 질문 → 위키백과 요약(+출처)
+        # 지식 질문 → 위키백과 요약(+출처). Gemma 4는 위키 첫 문장보다 스스로 더 잘 답해서 건너뜀(2026-11-08 사용자: "위키 때문에 멍청해 보인다")
+        wiki = None if answer or body.model == GEMMA_KEY else wiki_search.lookup(text)
         grounded = None
         if answer:
             reply, kept = answer, 0
@@ -381,7 +385,10 @@ def chat(body: ChatIn, request: Request):
                 reply, grounded = cf_chat.reply(text, body.history)
             except cf_chat.Busy:
                 # 503이면 페이지가 서버 전체를 '꺼짐'으로 보여 준다 → 429(잠시 후 다시)로. 무료 사용량은 매일 오전 9시에 다시 채워짐
-                raise HTTPException(status_code=429, detail="오늘 AI 사용량이 다 찼거나 잠시 바빠요")
+                q = cf_chat.usage()
+                msg = ("오늘 Gemma 4 무료 사용량을 다 썼어요. 한국 시각 오전 9시에 다시 채워져요."
+                       if q["left"] <= 0 else "Gemma 4가 잠시 바빠요. 조금 뒤에 다시 시도해 주세요.")
+                raise HTTPException(status_code=429, detail=msg)
             kept = min(len(body.history), cf_chat.HISTORY_TURNS) // 2
         else:
             m = get_model(body.model)
@@ -397,6 +404,8 @@ def chat(body: ChatIn, request: Request):
         out["source"] = wiki["url"]
     if grounded:
         out["grounded"] = grounded  # 페이지는 source가 있으면 '위키백과 답' 카드로 그리므로 근거 주소는 따로 둔다
+    if body.model == GEMMA_KEY:
+        out["quota"] = cf_chat.usage()  # 페이지가 '오늘 남은 사용량'을 바로 고침
     return out
 
 
