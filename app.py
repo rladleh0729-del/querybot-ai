@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from np_model import NPModel
 from np_sampling import banned_ids, pick_next, space_id_of
 import wiki_search  # 지식 질문은 위키백과에서 찾아 답함 (2026-10-20)
+import cf_chat  # 'Gemma 4'(Cloudflare Workers AI 무료) — 열쇠(CF_ACCOUNT_ID·CF_API_TOKEN)가 있을 때만 목록에 나옴 (2026-11-08)
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = Path(os.environ.get("AI_MODEL_DIR", str(
@@ -120,6 +121,10 @@ loaded = {"latest": Loaded("")}
 gc.collect()
 log(f"기본 모델 준비: {loaded['latest'].info}")
 CHOICES = [("latest", "최신 모델", "")] + [m for m in EXTRA_MODELS if has_files(m[2])]
+GEMMA_KEY = "gemma4"
+if cf_chat.ready():  # 파일 없이 Cloudflare가 답하는 모델 (앞머리 None)
+    CHOICES.append((GEMMA_KEY, "Gemma 4 (구글 26B)", None))
+log(f"Gemma 4(Cloudflare): {'켜짐' if cf_chat.ready() else '열쇠 없음 → 목록에서 뺌'}")
 load_lock = threading.Lock()
 
 
@@ -364,22 +369,34 @@ def chat(body: ChatIn, request: Request):
         # 기본 모델로 대화할 때만: 주인이 가르친 말이면 그 답을 바로 (다른 모델을 고른 방문자에겐 그 모델 답 그대로)
         answer = taught.get(teach_norm(text)) if body.model == "latest" else None
         wiki = None if answer else wiki_search.lookup(text)  # 지식 질문 → 위키백과 요약(+출처)
+        grounded = None
         if answer:
             reply, kept = answer, 0
         elif wiki:
             reply, kept = wiki["reply"], 0
+        elif body.model == GEMMA_KEY:
+            if not cf_chat.ready():
+                raise HTTPException(status_code=400, detail="없는 모델")
+            try:
+                reply, grounded = cf_chat.reply(text, body.history)
+            except cf_chat.Busy:
+                # 503이면 페이지가 서버 전체를 '꺼짐'으로 보여 준다 → 429(잠시 후 다시)로. 무료 사용량은 매일 오전 9시에 다시 채워짐
+                raise HTTPException(status_code=429, detail="오늘 AI 사용량이 다 찼거나 잠시 바빠요")
+            kept = min(len(body.history), cf_chat.HISTORY_TURNS) // 2
         else:
             m = get_model(body.model)
             reply, kept = make_reply(m, body.history, text)
     finally:
         in_flight.release()
-    kind = " (가르친 답)" if answer else " (위키백과)" if wiki else ""
+    kind = " (가르친 답)" if answer else " (위키백과)" if wiki else " (위키 근거)" if grounded else ""
     log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{kind} ({time.time() - t0:.1f}초)")
     out = {"reply": reply, "kept_turns": kept}
     if answer:
         out["taught"] = True
     if wiki:
         out["source"] = wiki["url"]
+    if grounded:
+        out["grounded"] = grounded  # 페이지는 source가 있으면 '위키백과 답' 카드로 그리므로 근거 주소는 따로 둔다
     return out
 
 
