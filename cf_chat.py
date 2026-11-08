@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 
+import calc_tool
 import wiki_search
 
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
@@ -37,6 +38,15 @@ SYSTEM_PROMPT = (
 # 위키 참고 자료: Gemma 4는 자료 없이 더 잘 답하고(에펠탑 330m·백두산 2,744m 정답, 모르는 건 모른다고 함),
 # 자료를 붙이면 "제공된 자료에 없어서 몰라요"처럼 오히려 멍청해 보여서 끔 (2026-11-08 시험·사용자 의견)
 USE_WIKI_CONTEXT = False
+# 계산기 도구 (2026-11-08): 모델이 복잡한 계산이 필요하다고 판단할 때만 <<calc: 식>>을 내고, 서버가 calc_tool로 정확히 계산해 돌려준다.
+USE_CALC = True
+CALC_PROMPT = (
+    " 복잡한 계산(세 자리 이상 곱셈·나눗셈, 소수 계산, 거듭제곱, 루트, 삼각함수, 로그, 팩토리얼, 퍼센트, 복리 등)이 필요하면 직접 계산하지 말고 "
+    "답 대신 한 줄로 <<calc: 식>> 만 써. 식에는 + - * / ** ( )와 sqrt(x), cbrt(x), root(x, n), sind/cosd/tand(도 단위), "
+    "sin/cos/tan(라디안), log(자연로그), log10, log2, exp, factorial(n), pi, e를 쓸 수 있어. "
+    "그러면 계산 결과를 알려 줄 테니 그 값으로 답해. 한두 자리 수의 쉬운 계산은 그냥 바로 답해."
+)
+CALC_TAG = re.compile(r"<<\s*calc\s*:\s*(.+?)\s*>>", re.S | re.I)
 FACT_Q = re.compile(r"(몇\s?(년|개|명|글자|자|번|살|층|미터|m|km|㎞)|언제|누가|누구|어디|어느 나라|인구|면적|태어난|태어났|사망|돌아가|"
                     r"발명|건립|세워진|설립|창제|만든 (해|사람)|길이|높이|무게|최초|처음 (만든|발견))")
 SELF_Q = re.compile(r"(^|\s)(너|넌|네|니|당신|쿼리봇|나|난|내|저|제|우리)(는|가|이|의|를|도|한테|랑|야)?(\s|$|[?!.])")
@@ -176,7 +186,7 @@ def _call(messages: list) -> dict:
 def reply(text: str, history: list):
     """(답, 위키 근거 주소 또는 None). history는 app.py의 Turn 목록(role, content)."""
     ctx = wiki_context(text) if USE_WIKI_CONTEXT else None
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "")}]
     for h in history[-HISTORY_TURNS:]:
         msgs.append({"role": h.role, "content": h.content[:600]})
     if ctx:
@@ -190,6 +200,22 @@ def reply(text: str, history: list):
         msgs.append({"role": "user", "content": text})
     d = _call(msgs)
     out = clean(d["choices"][0]["message"]["content"] or "")
+    for _ in range(2 if USE_CALC else 0):  # 계산기는 한 질문에 최대 2번
+        m = CALC_TAG.search(out)
+        if not m:
+            break
+        expr = m.group(1).strip()
+        try:
+            note = f"계산 결과: {expr} = {calc_tool.calc(expr)}"
+            log(f"계산기: {expr[:60]} 성공")
+        except Exception as e:  # noqa: BLE001 — 계산기가 못 하는 식
+            note = f"계산기가 이 식을 계산하지 못했어({e}). 계산 없이 아는 범위에서 답하고, 확실하지 않으면 정확히는 모른다고 해."
+            log(f"계산기: {expr[:60]} 실패 {type(e).__name__}")
+        msgs += [{"role": "assistant", "content": m.group(0)},
+                 {"role": "user", "content": note + "\n이 결과로 원래 질문에 자연스럽게 답해. 숫자는 계산 결과에 적힌 그대로 옮겨 적고 쉼표를 새로 넣지 마"
+                                                    "(긴 수에 쉼표를 넣다가 끝자리가 망가진 일이 있음). <<calc>>는 다시 쓰지 마."}]
+        out = clean(_call(msgs)["choices"][0]["message"]["content"] or "")
+    out = CALC_TAG.sub("", out).strip()  # 혹시 남은 표시는 지움
     if STRAY.search(out):  # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움)
         out = STRAY.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or "")).strip()
     return (out or "..."), (ctx[0][2] if ctx else None)
