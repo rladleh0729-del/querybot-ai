@@ -243,7 +243,7 @@ def _call(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
     body = json.dumps({"model": CF_MODEL, "messages": messages, "temperature": TEMPERATURE,
                        "max_tokens": max_tokens or (THINK_MAX_TOKENS if think else MAX_TOKENS),
                        "chat_template_kwargs": {"enable_thinking": think}}).encode("utf-8")
-    for attempt in range(2):  # Cloudflare 쪽 일시 오류(500 AiError 8005 등)는 1초 뒤 한 번 더 (2026-11-09 PC 시험에서 만남)
+    for attempt in range(3):  # Cloudflare 쪽 일시 오류(500 AiError 8005 등)는 1.5초·3초 뒤 두 번 더 (2026-11-09 PC·실서버에서 만남 → 사용자에게 '잠시 바빠요')
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "Authorization": "Bearer " + CF_API_TOKEN})
         try:
             with urllib.request.urlopen(req, timeout=THINK_TIMEOUT if think else TIMEOUT) as r:
@@ -252,8 +252,8 @@ def _call(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
             return d
         except urllib.error.HTTPError as e:
             log(f"Cloudflare 오류 {e.code}: {e.read().decode('utf-8', 'replace')[:200]}")  # 본문에 열쇠는 없음
-            if e.code >= 500 and attempt == 0:
-                time.sleep(1)
+            if e.code >= 500 and attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
                 continue
             raise Busy() from e
         except Exception as e:  # noqa: BLE001 — 연결 실패·시간 초과
@@ -362,6 +362,7 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
     mem = [" ".join(str(m).split())[:150] for m in (memory or []) if str(m).strip()][:MAX_MEMORY]
     if mem:
         system += " 이 사용자에 대해 이 브라우저에 저장된 기억: " + " / ".join(mem) + ". 자연스럽게 활용하되 매번 꺼내 말하지는 마."
+    system_plain = system  # 생각하기가 실패해 생각 없이 다시 부를 때 쓰는 지시문 ('생각했다'는 말이 없음)
     if think:
         system += (" 이번 답은 실제로 '생각하기' 기능을 켜고 만들어" + (f"지고, 사용자에게는 실제로 {secs}초 넘게 지난 뒤에 보여져" if secs else "져") +
                    ". 답하거나 도구(<<calc>>·<<search>>)를 쓰기 전에 반드시 속으로 충분히 따져 보는 생각 과정을 먼저 거쳐. "
@@ -374,7 +375,16 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
     t0 = time.time()
     # 생각하기는 시간을 정해도 토큰 한도를 줄이지 않는다 (예전엔 '10초'면 400토큰이라 생각+답이 잘림, 2026-11-09 사용자 신고).
     # 정한 시간보다 빨리 끝나면 아래에서 그 시간까지 기다리고, 늦게 끝나면 'n초 넘게' 생각한 것이라 사실과 어긋나지 않는다.
-    d1 = _call(msgs, think=think)
+    try:
+        d1 = _call(msgs, think=think)
+    except Busy:
+        # 그림 + 생각하기 요청에 Cloudflare가 내부 오류(500)를 내는 일이 있음(2026-11-09 실서버·PC) → 생각 없이라도 답한다(생각했다고는 말하지 않게)
+        if not think:
+            raise
+        log("생각하기 요청 실패 → 생각 없이 다시")
+        think = False
+        msgs[0] = {"role": "system", "content": system_plain}
+        d1 = _call(msgs)
     first = d1["choices"][0]["message"]
     raw = first.get("content") or ""
     reasoning = (first.get("reasoning_content") or "").strip() if think else ""
