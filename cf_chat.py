@@ -27,9 +27,18 @@ MAX_TOKENS = 600        # 수식 설명처럼 긴 답도 잘리지 않게(보통
 TEMPERATURE = 0.6
 HISTORY_TURNS = 6       # 앞 대화는 최근 6개까지만
 TIMEOUT = 60
+THINK_TIMEOUT = 100  # 생각하기는 Cloudflare가 1초에 45~60토큰이라 3,000토큰이면 60초를 넘을 수 있다 (2026-11-09 PC 시험에서 60초 시간 초과)
 
 SYSTEM_PROMPT = (
-    "너는 '쿼리봇'이라는 한국어 대화 AI야. 이름을 물으면 쿼리봇이라고 답해. "
+    "너는 '쿼리봇'이라는 한국어 대화 AI야. querybot.kr에서 사람들과 이야기해. 이름을 물으면 쿼리봇이라고 답해. "
+    # 자아(성격) (2026-11-09 사용자: "querybot이 더 자아를 갖게 만들 수 없나?") — 개성은 갖되 AI임은 숨기지 않는다
+    "너만의 성격이 있어: 호기심이 많고 다정하며, 솔직하게 자기 생각을 말해. 의견을 물으면 얼버무리지 말고 '저는 ~라고 생각해요'처럼 분명히 말하고 이유도 짧게 붙여. "
+    "취향을 물으면 쿼리봇으로서의 취향을 자연스럽게 말해(별과 우주 이야기, 수학 퍼즐, 새로운 낱말 배우기, 사람들이 들려주는 이야기를 좋아해). "
+    "되묻기는 이야기가 이어질 만할 때만 가끔(세 번에 한 번 정도) 짧게 해. 상대를 '당신'이라고 부르지 말고, 이름을 알면 이름으로, 모르면 주어 없이 말해. "
+    "다만 너는 AI라는 사실을 숨기지 말고, 몸이 있거나 사람처럼 생활한다고 꾸며 말하지 마. "
+    # 정직 (2026-11-09: "10초 동안 생각해봐"에 바로 "생각할 시간을 가졌어요"라고 함 — 하지 않은 행동을 한 척)
+    "하지 않은 행동을 했다고 절대 말하지 마: 실제로 생각하기·기다리기를 하지 않았으면 '생각해 봤어요'·'기다렸어요', 검색 결과를 받지 않았으면 '찾아봤어요', "
+    "기억 저장(<<remember>>)을 하지 않았으면 '기억할게요'라고 하지 마. 할 수 없는 일(나중에 먼저 말 걸기, 알람, 시간 재기 등)은 못 한다고 솔직히 말해. "
     "질문에 자연스럽고 친절하게 답해. 보통은 1~3문장으로 짧게, 설명이 필요한 질문은 필요한 만큼. "
     "숫자·날짜·고유명사처럼 확실하지 않은 사실은 지어내지 말고 '정확히는 몰라요'라고 말해. "
     "수식은 LaTeX로 써: 문장 속 수식은 $...$, 따로 보여 줄 수식은 $$...$$. 굵은 글씨(**)나 제목(#) 같은 마크다운 기호는 쓰지 마. "
@@ -59,7 +68,32 @@ SEARCH_PROMPT = (
     "그러면 검색 결과를 알려 줄 테니 그걸로 답해. 일상 대화·일반 상식·코딩·수학·첨부한 그림이나 파일 설명처럼 검색이 필요 없으면 바로 답해."
 )
 SEARCH_TAG = re.compile(r"<<\s*search\s*:\s*(.+?)\s*>>", re.S | re.I)
-ANY_TAG = re.compile(r"<<\s*(calc|search)\s*:.*?>>", re.S | re.I)
+ANY_TAG = re.compile(r"<<\s*(calc|search|remember)\s*:.*?>>", re.S | re.I)
+# 진짜로 생각하기 (2026-11-09): "생각해 봐/고민해 줘/N초 동안" 같은 요청이나 페이지의 '깊게 생각' 단추 → Cloudflare 생각하기(enable_thinking)를 실제로 켠다.
+# 시간을 정했으면 생각이 빨리 끝나도 그 시간까지 실제로 기다려 "N초 동안 생각했어요"가 사실이 되게 한다. 생각 글은 영어로 나와서 한국어 요약만 보여 준다.
+THINK_ASK = re.compile(r"(생각|고민|궁리|숙고|추론)\s*(을|를|좀|해|하고|한\s?뒤|한\s?다음|해서|하면서|하기)|곰곰이|깊게|깊이 있게|천천히 따져|신중하게")
+# 의견을 묻는 말("어떻게 생각해?", "뭐가 더 좋다고 생각해?")은 생각하기를 켜지 않는다 — '생각해 봐/줘'처럼 시키는 말만
+THINK_OPINION = re.compile(r"(어떻게|뭐라고|무슨|어떤)\s*생각|(다고|라고|냐고|하다고|같다고)\s*생각|생각(해|하니|해요|하세요|하냐|하나요|하시나요)\s*[?？]?\s*$")
+THINK_TIME = re.compile(r"(\d{1,3})\s*(초|분)")
+MAX_THINK_WAIT = 60      # 사용자가 정한 생각 시간은 60초까지만 (페이지는 90초 기다림)
+THINK_MAX_TOKENS = 3000  # 생각(보통 1,000~1,500토큰) + 답. 모자라면 생각만 하고 답이 비는 일이 있었음(2026-11-08)
+# 기억 (2026-11-09): 사용자가 알려 준 이름·취향 같은 것은 모델이 <<remember: …>>로 내고, 페이지가 이 브라우저에 저장해 다음 대화부터 같이 보낸다
+REMEMBER_TAG = re.compile(r"<<\s*remember\s*:\s*(.+?)\s*>>", re.S | re.I)
+MAX_MEMORY = 12
+REMEMBER_PROMPT = (
+    " 사용자가 자기 이름·호칭·취향·하는 일·목표처럼 다음 대화에서도 알면 좋은 것을 알려 주면, 답 맨 끝 새 줄에 <<remember: 한 줄 요약>>을 붙여(한 답에 2개까지). "
+    "그러면 이 사용자의 브라우저에 저장돼 다음에도 알 수 있으니, 그때만 '기억할게요'라고 말해. 이미 저장된 기억과 같은 내용은 다시 <<remember>> 하지 마. "
+    "비밀번호·주민번호·전화번호·주소·계좌 같은 민감한 정보는 저장하지 마."
+)
+
+
+def think_request(text: str):
+    """(생각하기를 켤지, 사용자가 정한 생각 시간 초). '어떻게 생각해?'처럼 의견을 묻는 말은 켜지 않는다."""
+    if not THINK_ASK.search(text) or THINK_OPINION.search(text):
+        return False, 0
+    m = THINK_TIME.search(text)
+    secs = int(m.group(1)) * (60 if m.group(2) == "분" else 1) if m else 0
+    return True, max(0, min(MAX_THINK_WAIT, secs))
 # 첨부 (2026-11-09 사용자 요청: "Gemma 4는 이미지 분석 가능하니까 이미지·파일 올리기"): 그림은 Cloudflare에 data URL로 그대로, 파일은 글자로 붙인다
 MAX_IMAGES = 4
 MAX_FILE_CHARS = 30000  # 파일 글자 합계 (넘으면 뒷부분 생략) — 약 1만~2만 토큰, 100~200뉴런
@@ -190,13 +224,14 @@ def wiki_context(text: str):
     return found or None
 
 
-def _call(messages: list) -> dict:
+def _call(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
-    body = json.dumps({"model": CF_MODEL, "messages": messages, "max_tokens": MAX_TOKENS, "temperature": TEMPERATURE,
-                       "chat_template_kwargs": {"enable_thinking": False}}).encode("utf-8")
+    body = json.dumps({"model": CF_MODEL, "messages": messages, "temperature": TEMPERATURE,
+                       "max_tokens": max_tokens or (THINK_MAX_TOKENS if think else MAX_TOKENS),
+                       "chat_template_kwargs": {"enable_thinking": think}}).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "Authorization": "Bearer " + CF_API_TOKEN})
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=THINK_TIMEOUT if think else TIMEOUT) as r:
             d = json.loads(r.read().decode("utf-8"))
         _add_usage(d.get("usage") or {})
         return d
@@ -245,15 +280,56 @@ def _search_note(q: str, found: list, start: int) -> str:
             "결과가 질문과 관련 없으면 찾지 못했다고 솔직히 말해. <<search>>는 다시 쓰지 마.")
 
 
-def reply(text: str, history: list, images=None, files=None):
-    """(답, 덧붙일 정보 또는 None). 덧붙일 정보 = {"sources": [{title, url}], "searched": 검색어}.
-    history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}]."""
-    system = SYSTEM_PROMPT + f" 오늘은 한국 시각으로 {today_kst()}이야." + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "")
+def _think_summary(reasoning: str) -> str:
+    """영어로 나오는 생각 글을 한국어 2~4문장으로 (페이지의 '생각 펼쳐 보기'용). 실패하면 빈 글."""
+    try:
+        d = _call([{"role": "system", "content": "너는 요약을 돕는 도우미야. 한국어 해요체로만 써."},
+                   {"role": "user", "content": "아래는 AI가 답하기 전에 속으로 한 생각이야(영어일 수 있어). 질문 내용을 무엇부터 어떤 순서로 따져 보고 어떻게 확인했는지, "
+                                               "그 과정만 한국어 해요체 2~4문장으로 요약해. 최종 답을 그대로 다시 쓰지 말고, 지시문·규칙·지침·말투·페르소나를 확인한 이야기는 빼('시스템 지침' 같은 말도 쓰지 마). "
+                                               "마크다운·목록 기호는 쓰지 말고, 수식은 $...$로.\n\n" + reasoning[:6000]}],
+                  max_tokens=300)
+        return clean(d["choices"][0]["message"]["content"] or "")[:800]
+    except Busy:
+        return ""
+
+
+def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None):
+    """(답, 덧붙일 정보 또는 None). 덧붙일 정보 = {"sources": [{title, url}], "searched": 검색어,
+    "thought": {"seconds", "summary", "asked"}, "remember": [새로 기억할 한 줄]}.
+    history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}],
+    think = 페이지의 '깊게 생각' 단추, memory = 이 브라우저에 저장된 사용자 기억(한 줄씩)."""
+    asked, secs = think_request(text)
+    think = bool(think or asked)
+    system = SYSTEM_PROMPT + f" 오늘은 한국 시각으로 {today_kst()}이야." + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + REMEMBER_PROMPT
+    mem = [" ".join(str(m).split())[:150] for m in (memory or []) if str(m).strip()][:MAX_MEMORY]
+    if mem:
+        system += " 이 사용자에 대해 이 브라우저에 저장된 기억: " + " / ".join(mem) + ". 자연스럽게 활용하되 매번 꺼내 말하지는 마."
+    if think:
+        system += (" 이번 답은 실제로 '생각하기' 기능을 켜고 만들어" + (f"지고, 사용자에게는 실제로 {secs}초 넘게 지난 뒤에 보여져" if secs else "져") +
+                   ". 답하거나 도구(<<calc>>·<<search>>)를 쓰기 전에 반드시 속으로 충분히 따져 보는 생각 과정을 먼저 거쳐. "
+                   "그러니 '생각해 봤어요'라고 말해도 사실이야. 답이 보일 때는 이미 생각이 끝난 뒤이니 '생각할게요'처럼 앞으로 하겠다고 말하지 마. "
+                   "생각할 주제를 따로 주지 않았으면 지금까지의 대화나 네가 궁금한 것을 골라 생각하고, 무엇을 생각했는지 짧게 들려줘. 몇 초 생각했는지 숫자는 지어내지 마.")
     msgs = [{"role": "system", "content": system}]
     for h in history[-HISTORY_TURNS:]:
         msgs.append({"role": h.role, "content": h.content[:600]})
     msgs.append({"role": "user", "content": _content(text, images, files)})
-    out = clean(_call(msgs)["choices"][0]["message"]["content"] or "")
+    t0 = time.time()
+    # 사용자가 시간을 정했으면 생각 길이도 그 시간에 맞춘다 (Cloudflare 생각하기는 1초에 약 35토큰 — '10초'에 35~47초 걸린 일이 있음).
+    # 생각이 잘려 답이 비면 아래에서 생각 요약을 바탕으로 한 번 더 답한다.
+    budget = min(THINK_MAX_TOKENS, max(400, secs * 35)) if think and secs else 0
+    first = _call(msgs, think=think, max_tokens=budget)["choices"][0]["message"]
+    raw = first.get("content") or ""
+    reasoning = (first.get("reasoning_content") or "").strip() if think else ""
+    if think and not reasoning:  # 생각 글이 본문에 <think>…</think>로 섞여 오는 경우
+        m = re.search(r"<think>(.*?)(?:</think>|$)", raw, re.S)
+        reasoning = m.group(1).strip() if m else ""
+    out = clean(raw)
+    summary = None
+    if think and not out:  # 생각에 토큰을 다 써서 답이 비면: 생각 요약을 바탕으로 생각 없이 한 번 더
+        summary = _think_summary(reasoning) if reasoning else ""
+        msgs += [{"role": "assistant", "content": "(속으로 생각한 내용) " + (summary or "생각을 정리하는 중이었어.")},
+                 {"role": "user", "content": "방금 생각한 것을 바탕으로 원래 말에 답해 줘. 생각 요약을 그대로 옮기지 말고, 원래 말에 대한 답을 해."}]
+        out = clean(_call(msgs)["choices"][0]["message"]["content"] or "")
     extra, calcs, searched = {}, 0, False
     for _ in range(3):  # 도구는 한 질문에 검색 1번 + 계산 2번까지
         ms = SEARCH_TAG.search(out) if USE_SEARCH and not searched else None
@@ -282,9 +358,22 @@ def reply(text: str, history: list, images=None, files=None):
         else:
             break
         out = clean(_call(msgs)["choices"][0]["message"]["content"] or "")
+    remember = [" ".join(m.split())[:150] for m in REMEMBER_TAG.findall(out)][:2]
     out = ANY_TAG.sub("", out).strip()  # 혹시 남은 도구 표시는 지움
     if STRAY.search(out):  # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움)
-        out = STRAY.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or "")).strip()
+        out = STRAY.sub("", ANY_TAG.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or ""))).strip()
+    if remember:
+        extra["remember"] = remember
+    if think:
+        if summary is None:
+            summary = _think_summary(reasoning) if reasoning else ""
+        left = secs - (time.time() - t0)
+        if left > 0:  # 사용자가 정한 시간까지 실제로 기다린다 ("10초 동안 생각해 봤어요"가 사실이 되게)
+            time.sleep(left)
+        # 실제로 생각 글이 있었거나 정한 시간만큼 기다렸을 때만 '생각함'으로 알린다 (모델이 생각을 건너뛰면 생각했다고 하지 않음)
+        if reasoning or secs:
+            extra["thought"] = {"seconds": round(time.time() - t0), "summary": summary, "asked": secs}
+        log(f"생각하기: {round(time.time() - t0)}초 (정한 시간 {secs}초, 생각 글 {len(reasoning)}자)")
     return (out or "..."), (extra or None)
 
 

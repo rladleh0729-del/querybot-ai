@@ -159,6 +159,8 @@ def get_model(key: str) -> Loaded:
 
 generate_lock = threading.Lock()
 in_flight = threading.BoundedSemaphore(MAX_IN_FLIGHT)
+# Gemma 4는 Cloudflare가 계산해서 이 서버 CPU를 거의 안 쓴다. '깊게 생각'은 30초 넘게 걸리므로 기본 모델 칸(3개)을 막지 않게 따로 (2026-11-09)
+gemma_in_flight = threading.BoundedSemaphore(8)
 
 
 def build_prompt(m: Loaded, history: list, text: str):
@@ -322,6 +324,9 @@ class ChatIn(BaseModel):
     # 그림 첨부: 페이지가 긴 변 1280px JPEG로 줄인 data URL (Gemma 4만, 2026-11-09 사용자 요청)
     images: list[str] = Field(default_factory=list, max_length=4)
     files: list[FileIn] = Field(default_factory=list, max_length=5)
+    # 쿼리봇 자아 (2026-11-09): '깊게 생각' 단추, 이 브라우저에 저장된 사용자 기억(한 줄씩, Gemma 4만 씀)
+    think: bool = False
+    memory: list[str] = Field(default_factory=list, max_length=12)
 
 
 IMAGE_URL = re.compile(r"^data:image/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$")
@@ -390,7 +395,8 @@ def chat(body: ChatIn, request: Request):
     if len(text) > MAX_INPUT_CHARS:
         raise HTTPException(status_code=400, detail=f"{MAX_INPUT_CHARS}자 이하로")
     check_rate_limit(client_ip(request))
-    if not in_flight.acquire(blocking=False):
+    slot = gemma_in_flight if body.model == GEMMA_KEY else in_flight
+    if not slot.acquire(blocking=False):
         # 503이 아니라 429: 페이지는 503을 '서버 꺼짐'으로 보여 준다.
         raise HTTPException(status_code=429, detail="잠시 후 다시 시도")
     try:
@@ -409,7 +415,7 @@ def chat(body: ChatIn, request: Request):
                 raise HTTPException(status_code=400, detail="없는 모델")
             try:
                 # 그림·파일 첨부와 웹 검색은 Gemma 4만 (2026-11-09 사용자 요청)
-                reply, extra = cf_chat.reply(text, body.history, body.images, body.files)
+                reply, extra = cf_chat.reply(text, body.history, body.images, body.files, think=body.think, memory=body.memory)
             except cf_chat.Busy:
                 # 503이면 페이지가 서버 전체를 '꺼짐'으로 보여 준다 → 429(잠시 후 다시)로. 무료 사용량은 매일 오전 9시에 다시 채워짐
                 q = cf_chat.usage()
@@ -421,12 +427,16 @@ def chat(body: ChatIn, request: Request):
             m = get_model(body.model)
             reply, kept = make_reply(m, body.history, text)
     finally:
-        in_flight.release()
+        slot.release()
     kind = " (가르친 답)" if answer else " (위키백과)" if wiki else ""
     if attached:
         kind += f" [그림 {len(body.images)}·파일 {len(body.files)}]"
     if extra and extra.get("searched"):
         kind += f" [검색 {len(extra.get('sources', []))}건]"  # 검색어는 방문자가 쓴 말이라 로그에 남기지 않는다
+    if extra and extra.get("thought"):
+        kind += f" [생각 {extra['thought']['seconds']}초]"
+    if extra and extra.get("remember"):
+        kind += f" [기억 {len(extra['remember'])}줄]"  # 기억 내용은 남기지 않는다
     log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{kind} ({time.time() - t0:.1f}초)")
     out = {"reply": reply, "kept_turns": kept}
     if answer:
@@ -438,6 +448,10 @@ def chat(body: ChatIn, request: Request):
         out["sources"] = extra.get("sources", [])[:10]
         if extra.get("searched"):
             out["searched"] = extra["searched"]
+        if extra.get("thought"):
+            out["thought"] = extra["thought"]  # {seconds, summary(한국어 요약), asked(사용자가 정한 초)}
+        if extra.get("remember"):
+            out["remember"] = extra["remember"]  # 페이지가 이 브라우저에 저장할 새 기억
     if body.model == GEMMA_KEY:
         out["quota"] = cf_chat.usage()  # 페이지가 '오늘 남은 사용량'을 바로 고침
     return out
