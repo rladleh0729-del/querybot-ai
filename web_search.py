@@ -109,14 +109,34 @@ def _bing(q: str) -> list:
     return out
 
 
+# 시간이 중요한 검색(오늘·내일·최근·날씨·환율…)은 최신 글 위주로. 정확도순으로 찾으면 몇 년 전 커뮤니티 글의 환율(1,324원)을
+# 오늘 값처럼 말한 일이 있음(2026-11-09 실서버). 커뮤니티 글은 지우지 않고 뒤로 미룬다.
+TIME_WORDS = re.compile(r"오늘|내일|어제|모레|현재|지금|최근|최신|요즘|이번\s?(주|달|해|시즌)|올해|실시간|속보|날씨|기온|미세먼지|환율|주가|시세|"
+                        r"금리|일정|경기 결과|순위|출시|발표|today|tomorrow|latest|current|now", re.I)
+LOW_QUALITY = re.compile(r"(^|\.)(dcinside\.com|ppomppu\.co\.kr|ezday\.co\.kr|fmkorea\.com|theqoo\.net|instiz\.net|humoruniv\.com|"
+                         r"todayhumor\.co\.kr|picjjang\.com|ilbe\.com|clien\.net|mlbpark\.donga\.com|bobaedream\.co\.kr)$")
+
+
+def _host(u: str) -> str:
+    try:
+        return urllib.parse.urlsplit(u).netloc.lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _kakao(q: str) -> list:
-    """카카오 Daum 웹문서 검색 (환경변수 KAKAO_REST_API_KEY, 무료 하루 30,000건, 2026-11-09 사용자 추천). 한국어 결과가 가장 좋음."""
-    url = "https://dapi.kakao.com/v2/search/web?" + urllib.parse.urlencode({"query": q, "size": MAX_RESULTS, "sort": "accuracy"})
+    """카카오 Daum 웹문서 검색 (환경변수 KAKAO_REST_API_KEY, 무료 하루 30,000건, 2026-11-09 사용자 추천). 한국어 결과가 가장 좋음.
+    결과마다 작성일(date)을 붙여 모델이 오래된 자료를 알아보게 한다."""
+    fresh = bool(TIME_WORDS.search(q))
+    url = "https://dapi.kakao.com/v2/search/web?" + urllib.parse.urlencode({"query": q, "size": 10, "sort": "recency" if fresh else "accuracy"})
     req = urllib.request.Request(url, headers={"Authorization": "KakaoAK " + KAKAO_KEY})
     with urllib.request.urlopen(req, timeout=6) as r:
         d = json.loads(r.read().decode("utf-8"))
-    return [{"title": _strip(x.get("title"))[:120], "url": x.get("url") or "", "snippet": _strip(x.get("contents"))[:400]}
-            for x in d.get("documents") or [] if (x.get("url") or "").startswith("http")]
+    out = [{"title": _strip(x.get("title"))[:120], "url": x.get("url") or "", "snippet": _strip(x.get("contents"))[:400],
+            "date": (x.get("datetime") or "")[:10]}
+           for x in d.get("documents") or [] if (x.get("url") or "").startswith("http")]
+    out.sort(key=lambda x: bool(LOW_QUALITY.search(_host(x["url"]))))  # 순서는 그대로 두고 커뮤니티 글만 뒤로
+    return out
 
 
 def _tavily(q: str) -> list:
@@ -168,17 +188,35 @@ def search(q: str) -> list:
             return hit[1]
     t0 = time.time()
     found, used = [], ""
+    # 시간이 중요한 검색은 카카오와 Bing을 함께 돌려 섞는다 (Bing은 '8시간 전'처럼 최신 요약이 잘 잡힘, 카카오는 한국어 글이 많음)
+    fresh = bool(TIME_WORDS.search(q)) and bool(KAKAO_KEY)
+    pool = concurrent.futures.ThreadPoolExecutor(1) if fresh else None
+    side = pool.submit(_bing, q) if pool else None
     for name, fn, ok in (("kakao", _kakao, KAKAO_KEY), ("tavily", _tavily, TAVILY_KEY), ("brave", _brave, BRAVE_KEY),
                          ("bing", _bing, True), ("ddg", _ddg, True)):
         if not ok:
             continue
         try:
-            found = fn(q)[:MAX_RESULTS]
+            found = fn(q)[:10]
             used = name
             if found:
                 break
         except Exception as e:  # noqa: BLE001
             log(f"{name} 실패: {type(e).__name__} {str(e)[:80]}")
+    if side:
+        try:
+            more = [x for x in side.result(timeout=7) if not LOW_QUALITY.search(_host(x["url"]))]
+        except Exception as e:  # noqa: BLE001
+            more = []
+            log(f"bing(함께) 실패: {type(e).__name__} {str(e)[:60]}")
+        pool.shutdown(wait=False)
+        if more and used != "bing":
+            have = {x["url"] for x in found}
+            good = [x for x in found if not LOW_QUALITY.search(_host(x["url"]))]
+            rest = [x for x in found if LOW_QUALITY.search(_host(x["url"]))]
+            found = good[:3] + [x for x in more if x["url"] not in have][:2] + good[3:] + rest
+            used += "+bing"
+    found = found[:MAX_RESULTS]
     # 위 결과 몇 개는 본문도 읽어 온다 (Tavily는 이미 본문 요약을 줌)
     need = [x for x in found[:PAGE_READ] if not x.get("full")]
     if need:
