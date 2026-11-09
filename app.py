@@ -317,6 +317,11 @@ class FileIn(BaseModel):
     text: str = Field(default="", max_length=40000)
 
 
+class LocIn(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+
+
 class ChatIn(BaseModel):
     message: str = Field(max_length=MAX_INPUT_CHARS * 4)
     model: str = Field(default="latest", max_length=32)
@@ -327,6 +332,8 @@ class ChatIn(BaseModel):
     # 쿼리봇 자아 (2026-11-09): '깊게 생각' 단추, 이 브라우저에 저장된 사용자 기억(한 줄씩, Gemma 4만 씀)
     think: bool = False
     memory: list[str] = Field(default_factory=list, max_length=12)
+    # 위치 공유 (2026-11-09): 페이지의 '위치' 단추를 켰을 때만, 대략 좌표(소수 둘째 자리). 저장·로그 안 함
+    location: LocIn | None = None
 
 
 IMAGE_URL = re.compile(r"^data:image/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$")
@@ -415,7 +422,8 @@ def chat(body: ChatIn, request: Request):
                 raise HTTPException(status_code=400, detail="없는 모델")
             try:
                 # 그림·파일 첨부와 웹 검색은 Gemma 4만 (2026-11-09 사용자 요청)
-                reply, extra = cf_chat.reply(text, body.history, body.images, body.files, think=body.think, memory=body.memory)
+                reply, extra = cf_chat.reply(text, body.history, body.images, body.files, think=body.think, memory=body.memory,
+                                             location=body.location.model_dump() if body.location else None)
             except cf_chat.Busy:
                 # 503이면 페이지가 서버 전체를 '꺼짐'으로 보여 준다 → 429(잠시 후 다시)로. 무료 사용량은 매일 오전 9시에 다시 채워짐
                 q = cf_chat.usage()
@@ -437,6 +445,8 @@ def chat(body: ChatIn, request: Request):
         kind += f" [생각 {extra['thought']['seconds']}초]"
     if extra and extra.get("remember"):
         kind += f" [기억 {len(extra['remember'])}줄]"  # 기억 내용은 남기지 않는다
+    if body.location:
+        kind += " [위치]"  # 좌표·동네 이름은 남기지 않는다
     log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{kind} ({time.time() - t0:.1f}초)")
     out = {"reply": reply, "kept_turns": kept}
     if answer:

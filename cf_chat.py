@@ -17,17 +17,23 @@ import urllib.error
 import urllib.request
 
 import calc_tool
+import weather
 import web_search
 import wiki_search
 
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
 CF_MODEL = os.environ.get("CF_MODEL", "@cf/google/gemma-4-26b-a4b-it")
-MAX_TOKENS = 600        # 수식 설명처럼 긴 답도 잘리지 않게(보통 답은 30~110토큰)
+# 답 길이 한도. 600이던 때 그림 속 수학 문제 풀이가 "f(3) = -10을 대"에서 끊김(2026-11-09 사용자 신고) → 넉넉히(사용량은 실제로 쓴 토큰만 듦).
+# 그래도 한도에 걸리면(finish_reason == "length") _finish()가 끊긴 자리부터 이어 쓰게 한다.
+MAX_TOKENS = 2000
+CONTINUE_MAX = 2        # 이어 쓰기 최대 횟수
+CONTINUE_NOTE = "답이 길이 제한 때문에 중간에 끊겼어. 이미 쓴 부분은 되풀이하지 말고, 끊긴 바로 그 자리(글자)부터 이어서 끝까지 써."
+CUT_NOTE = "\n\n(답이 길어서 여기까지만 썼어요.)"
 TEMPERATURE = 0.6
 HISTORY_TURNS = 6       # 앞 대화는 최근 6개까지만
 TIMEOUT = 60
-THINK_TIMEOUT = 100  # 생각하기는 Cloudflare가 1초에 45~60토큰이라 3,000토큰이면 60초를 넘을 수 있다 (2026-11-09 PC 시험에서 60초 시간 초과)
+THINK_TIMEOUT = 130  # 생각하기는 Cloudflare가 1초에 35~60토큰이라 4,000토큰이면 60초를 넘을 수 있다 (2026-11-09 PC 시험에서 60초 시간 초과). 페이지는 150초 기다림
 
 SYSTEM_PROMPT = (
     "너는 '쿼리봇'이라는 한국어 대화 AI야. querybot.kr에서 사람들과 이야기해. 이름을 물으면 쿼리봇이라고 답해. "
@@ -68,7 +74,15 @@ SEARCH_PROMPT = (
     "그러면 검색 결과를 알려 줄 테니 그걸로 답해. 일상 대화·일반 상식·코딩·수학·첨부한 그림이나 파일 설명처럼 검색이 필요 없으면 바로 답해."
 )
 SEARCH_TAG = re.compile(r"<<\s*search\s*:\s*(.+?)\s*>>", re.S | re.I)
-ANY_TAG = re.compile(r"<<\s*(calc|search|remember)\s*:.*?>>", re.S | re.I)
+ANY_TAG = re.compile(r"<<\s*(calc|search|remember|weather)\s*:.*?>>", re.S | re.I)
+# 날씨 도구 (2026-11-09): 웹 검색으로 날씨를 찾으면 맛집·PDF가 걸려서, 날씨는 weather.py(OpenStreetMap 지명 + Open-Meteo 예보)로
+WEATHER_PROMPT = (
+    " 날씨·기온·비·눈·바람처럼 날씨를 물으면 웹 검색 말고 답 대신 한 줄로 <<weather: 지역 이름>> 만 써(예: <<weather: 서울 서초구>>). "
+    "지역을 말하지 않았을 때: 사용자의 위치가 알려져 있으면 <<weather: 내 위치>>를 쓰고, 위치를 모르면 어느 지역인지 물어보면서 "
+    "입력칸의 '위치' 단추를 켜면 지금 있는 곳의 날씨를 바로 알려 줄 수 있다고 말해. 앞 대화에서 지역을 말했으면 그 지역을 써."
+)
+WEATHER_TAG = re.compile(r"<<\s*weather\s*:\s*(.+?)\s*>>", re.S | re.I)
+MY_PLACE = re.compile(r"^(내\s*위치|현재\s*위치|지금\s*위치|여기|이\s*근처|내\s*근처|사용자\s*위치)$")
 # 진짜로 생각하기 (2026-11-09): "생각해 봐/고민해 줘/N초 동안" 같은 요청이나 페이지의 '깊게 생각' 단추 → Cloudflare 생각하기(enable_thinking)를 실제로 켠다.
 # 시간을 정했으면 생각이 빨리 끝나도 그 시간까지 실제로 기다려 "N초 동안 생각했어요"가 사실이 되게 한다. 생각 글은 영어로 나와서 한국어 요약만 보여 준다.
 THINK_ASK = re.compile(r"(생각|고민|궁리|숙고|추론)\s*(을|를|좀|해|하고|한\s?뒤|한\s?다음|해서|하면서|하기)|곰곰이|깊게|깊이 있게|천천히 따져|신중하게")
@@ -76,7 +90,7 @@ THINK_ASK = re.compile(r"(생각|고민|궁리|숙고|추론)\s*(을|를|좀|해
 THINK_OPINION = re.compile(r"(어떻게|뭐라고|무슨|어떤)\s*생각|(다고|라고|냐고|하다고|같다고)\s*생각|생각(해|하니|해요|하세요|하냐|하나요|하시나요)\s*[?？]?\s*$")
 THINK_TIME = re.compile(r"(\d{1,3})\s*(초|분)")
 MAX_THINK_WAIT = 60      # 사용자가 정한 생각 시간은 60초까지만 (페이지는 90초 기다림)
-THINK_MAX_TOKENS = 3000  # 생각(보통 1,000~1,500토큰) + 답. 모자라면 생각만 하고 답이 비는 일이 있었음(2026-11-08)
+THINK_MAX_TOKENS = 4000  # 생각(보통 1,000~1,500토큰) + 답. 모자라면 생각만 하고 답이 비거나 답이 중간에 끊김(2026-11-08, 11-09)
 # 기억 (2026-11-09): 사용자가 알려 준 이름·취향 같은 것은 모델이 <<remember: …>>로 내고, 페이지가 이 브라우저에 저장해 다음 대화부터 같이 보낸다
 REMEMBER_TAG = re.compile(r"<<\s*remember\s*:\s*(.+?)\s*>>", re.S | re.I)
 MAX_MEMORY = 12
@@ -229,18 +243,23 @@ def _call(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
     body = json.dumps({"model": CF_MODEL, "messages": messages, "temperature": TEMPERATURE,
                        "max_tokens": max_tokens or (THINK_MAX_TOKENS if think else MAX_TOKENS),
                        "chat_template_kwargs": {"enable_thinking": think}}).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "Authorization": "Bearer " + CF_API_TOKEN})
-    try:
-        with urllib.request.urlopen(req, timeout=THINK_TIMEOUT if think else TIMEOUT) as r:
-            d = json.loads(r.read().decode("utf-8"))
-        _add_usage(d.get("usage") or {})
-        return d
-    except urllib.error.HTTPError as e:
-        log(f"Cloudflare 오류 {e.code}: {e.read().decode('utf-8', 'replace')[:200]}")  # 본문에 열쇠는 없음
-        raise Busy() from e
-    except Exception as e:  # noqa: BLE001 — 연결 실패·시간 초과
-        log(f"Cloudflare 연결 실패: {type(e).__name__}")
-        raise Busy() from e
+    for attempt in range(2):  # Cloudflare 쪽 일시 오류(500 AiError 8005 등)는 1초 뒤 한 번 더 (2026-11-09 PC 시험에서 만남)
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "Authorization": "Bearer " + CF_API_TOKEN})
+        try:
+            with urllib.request.urlopen(req, timeout=THINK_TIMEOUT if think else TIMEOUT) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            _add_usage(d.get("usage") or {})
+            return d
+        except urllib.error.HTTPError as e:
+            log(f"Cloudflare 오류 {e.code}: {e.read().decode('utf-8', 'replace')[:200]}")  # 본문에 열쇠는 없음
+            if e.code >= 500 and attempt == 0:
+                time.sleep(1)
+                continue
+            raise Busy() from e
+        except Exception as e:  # noqa: BLE001 — 연결 실패·시간 초과
+            log(f"Cloudflare 연결 실패: {type(e).__name__}")
+            raise Busy() from e
+    raise Busy()
 
 
 def _field(x, k):
@@ -296,14 +315,50 @@ def _think_summary(reasoning: str) -> str:
         return ""
 
 
-def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None):
+def _finish(msgs: list, d: dict, out: str) -> str:
+    """답이 한도에 걸려 끊겼으면(finish_reason == "length") 끊긴 자리부터 이어 쓰게 해서 붙인다. 그래도 끊기면 끝에 표시."""
+    fin = d["choices"][0].get("finish_reason") or ""
+    n = 0
+    while fin == "length" and out and n < CONTINUE_MAX:
+        n += 1
+        d = _call(msgs + [{"role": "assistant", "content": out}, {"role": "user", "content": CONTINUE_NOTE}])
+        more = clean(d["choices"][0]["message"]["content"] or "")
+        fin = d["choices"][0].get("finish_reason") or ""
+        if not more:
+            break
+        out += more
+    if n:
+        log(f"이어 쓰기 {n}번 ({'그래도 끊김' if fin == 'length' else '끝까지'})")
+    if fin == "length" and out:
+        out += CUT_NOTE
+    return out
+
+
+def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None):
     """(답, 덧붙일 정보 또는 None). 덧붙일 정보 = {"sources": [{title, url}], "searched": 검색어,
     "thought": {"seconds", "summary", "asked"}, "remember": [새로 기억할 한 줄]}.
     history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}],
     think = 페이지의 '깊게 생각' 단추, memory = 이 브라우저에 저장된 사용자 기억(한 줄씩)."""
     asked, secs = think_request(text)
     think = bool(think or asked)
-    system = SYSTEM_PROMPT + f" 오늘은 한국 시각으로 {today_kst()}이야." + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + REMEMBER_PROMPT
+    # 위치 공유 (2026-11-09): 페이지의 '위치' 단추를 켜면 대략 좌표(소수 둘째 자리 ≈ 1km)가 온다 → 동네 이름으로 바꿔 알려 준다(로그에는 안 남김)
+    loc = None
+    if location:
+        try:
+            la, lo = float(_field(location, "lat")), float(_field(location, "lon"))
+            if -90 <= la <= 90 and -180 <= lo <= 180:
+                loc = (round(la, 2), round(lo, 2), weather.reverse(la, lo))
+        except (TypeError, ValueError):
+            loc = None
+    if loc:  # 위치를 알면 '지역 없는 날씨 질문 = 내 위치'로 (위치를 켰는데도 지역을 되묻던 일, 2026-11-09 PC 시험)
+        wp = (f" 사용자가 위치 공유를 켰어: 지금 대략 {loc[2] or '알 수 없는 동네'} 근처에 있어(위도 {loc[0]}, 경도 {loc[1]}). "
+              " 날씨·기온·비·눈·바람처럼 날씨를 물으면 웹 검색 말고 답 대신 한 줄로 <<weather: 지역 이름>> 만 써. "
+              "지역을 말하지 않은 날씨 질문은 사용자가 있는 곳의 날씨를 묻는 것이니 반드시 <<weather: 내 위치>> 를 쓰고, 어느 지역인지 되묻지 마. "
+              "앞 대화에서 다른 지역을 말했으면 그 지역을 써. 위치는 날씨·근처 장소 질문에만 쓰고, 묻지 않았는데 위치를 꺼내 말하지는 마.")
+    else:
+        wp = WEATHER_PROMPT
+    system = (SYSTEM_PROMPT + f" 오늘은 한국 시각으로 {today_kst()}이야." + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "")
+              + wp + REMEMBER_PROMPT)
     mem = [" ".join(str(m).split())[:150] for m in (memory or []) if str(m).strip()][:MAX_MEMORY]
     if mem:
         system += " 이 사용자에 대해 이 브라우저에 저장된 기억: " + " / ".join(mem) + ". 자연스럽게 활용하되 매번 꺼내 말하지는 마."
@@ -317,27 +372,40 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
         msgs.append({"role": h.role, "content": h.content[:600]})
     msgs.append({"role": "user", "content": _content(text, images, files)})
     t0 = time.time()
-    # 사용자가 시간을 정했으면 생각 길이도 그 시간에 맞춘다 (Cloudflare 생각하기는 1초에 약 35토큰 — '10초'에 35~47초 걸린 일이 있음).
-    # 생각이 잘려 답이 비면 아래에서 생각 요약을 바탕으로 한 번 더 답한다.
-    budget = min(THINK_MAX_TOKENS, max(400, secs * 35)) if think and secs else 0
-    first = _call(msgs, think=think, max_tokens=budget)["choices"][0]["message"]
+    # 생각하기는 시간을 정해도 토큰 한도를 줄이지 않는다 (예전엔 '10초'면 400토큰이라 생각+답이 잘림, 2026-11-09 사용자 신고).
+    # 정한 시간보다 빨리 끝나면 아래에서 그 시간까지 기다리고, 늦게 끝나면 'n초 넘게' 생각한 것이라 사실과 어긋나지 않는다.
+    d1 = _call(msgs, think=think)
+    first = d1["choices"][0]["message"]
     raw = first.get("content") or ""
     reasoning = (first.get("reasoning_content") or "").strip() if think else ""
     if think and not reasoning:  # 생각 글이 본문에 <think>…</think>로 섞여 오는 경우
         m = re.search(r"<think>(.*?)(?:</think>|$)", raw, re.S)
         reasoning = m.group(1).strip() if m else ""
-    out = clean(raw)
+    out = _finish(msgs, d1, clean(raw))
     summary = None
     if think and not out:  # 생각에 토큰을 다 써서 답이 비면: 생각 요약을 바탕으로 생각 없이 한 번 더
         summary = _think_summary(reasoning) if reasoning else ""
         msgs += [{"role": "assistant", "content": "(속으로 생각한 내용) " + (summary or "생각을 정리하는 중이었어.")},
                  {"role": "user", "content": "방금 생각한 것을 바탕으로 원래 말에 답해 줘. 생각 요약을 그대로 옮기지 말고, 원래 말에 대한 답을 해."}]
-        out = clean(_call(msgs)["choices"][0]["message"]["content"] or "")
-    extra, calcs, searched = {}, 0, False
-    for _ in range(3):  # 도구는 한 질문에 검색 1번 + 계산 2번까지
+        d = _call(msgs)
+        out = _finish(msgs, d, clean(d["choices"][0]["message"]["content"] or ""))
+    extra, calcs, searched, weathered = {}, 0, False, False
+    for _ in range(4):  # 도구는 한 질문에 날씨 1번 + 검색 1번 + 계산 2번까지
+        mw = WEATHER_TAG.search(out) if not weathered else None
         ms = SEARCH_TAG.search(out) if USE_SEARCH and not searched else None
         mc = CALC_TAG.search(out) if USE_CALC and calcs < 2 else None
-        if ms:
+        if mw:
+            weathered = True
+            place = mw.group(1).strip()[:60]
+            if MY_PLACE.match(place):
+                note, src = weather.report(lat=loc[0], lon=loc[1]) if loc else (
+                    "사용자의 위치를 몰라(위치 공유가 꺼져 있어). 어느 지역 날씨인지 물어보고, 입력칸의 '위치' 단추를 켜면 바로 알 수 있다고 알려 줘. 숫자는 지어내지 마.", None)
+            else:
+                note, src = weather.report(place)
+            if src:
+                extra.setdefault("sources", []).append(src)
+            msgs += [{"role": "assistant", "content": mw.group(0)}, {"role": "user", "content": note}]
+        elif ms:
             searched = True
             q = ms.group(1).strip()[:120]
             found = web_search.search(q)
@@ -360,7 +428,8 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
                                                         "(긴 수에 쉼표를 넣다가 끝자리가 망가진 일이 있음). <<calc>>는 다시 쓰지 마."}]
         else:
             break
-        out = clean(_call(msgs)["choices"][0]["message"]["content"] or "")
+        d = _call(msgs)
+        out = _finish(msgs, d, clean(d["choices"][0]["message"]["content"] or ""))
     remember = [" ".join(m.split())[:150] for m in REMEMBER_TAG.findall(out)][:2]
     out = ANY_TAG.sub("", out).strip()  # 혹시 남은 도구 표시는 지움
     if STRAY.search(out):  # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움)
