@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 
 import calc_tool
+import web_search
 import wiki_search
 
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
@@ -50,6 +51,24 @@ CALC_PROMPT = (
     "그러면 계산 결과를 알려 줄 테니 그 값으로 답해. 한두 자리 수의 쉬운 계산은 그냥 바로 답해."
 )
 CALC_TAG = re.compile(r"<<\s*calc\s*:\s*(.+?)\s*>>", re.S | re.I)
+# 웹 검색 도구 (2026-11-09 사용자 요청): 최신 정보·모르는 사실·검색 요청이면 모델이 <<search: 검색어>>를 내고, 서버가 web_search로 찾아 돌려준다
+USE_SEARCH = True
+SEARCH_PROMPT = (
+    " 최신 정보(최근 뉴스, 오늘 날짜 근처의 일, 가격·환율·주가·날씨·일정·순위·출시 소식)나 네가 확실히 모르는 사실이 필요할 때, "
+    "또는 사용자가 검색·찾아보기를 부탁할 때는 답 대신 한 줄로 <<search: 검색어>> 만 써. 검색어는 핵심 낱말 위주로 짧게. "
+    "그러면 검색 결과를 알려 줄 테니 그걸로 답해. 일상 대화·일반 상식·코딩·수학·첨부한 그림이나 파일 설명처럼 검색이 필요 없으면 바로 답해."
+)
+SEARCH_TAG = re.compile(r"<<\s*search\s*:\s*(.+?)\s*>>", re.S | re.I)
+ANY_TAG = re.compile(r"<<\s*(calc|search)\s*:.*?>>", re.S | re.I)
+# 첨부 (2026-11-09 사용자 요청: "Gemma 4는 이미지 분석 가능하니까 이미지·파일 올리기"): 그림은 Cloudflare에 data URL로 그대로, 파일은 글자로 붙인다
+MAX_IMAGES = 4
+MAX_FILE_CHARS = 30000  # 파일 글자 합계 (넘으면 뒷부분 생략) — 약 1만~2만 토큰, 100~200뉴런
+WEEKDAYS = "월화수목금토일"
+
+
+def today_kst() -> str:
+    d = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    return f"{d.year}년 {d.month}월 {d.day}일({WEEKDAYS[d.weekday()]})"
 FACT_Q = re.compile(r"(몇\s?(년|개|명|글자|자|번|살|층|미터|m|km|㎞)|언제|누가|누구|어디|어느 나라|인구|면적|태어난|태어났|사망|돌아가|"
                     r"발명|건립|세워진|설립|창제|만든 (해|사람)|길이|높이|무게|최초|처음 (만든|발견))")
 SELF_Q = re.compile(r"(^|\s)(너|넌|네|니|당신|쿼리봇|나|난|내|저|제|우리)(는|가|이|의|를|도|한테|랑|야)?(\s|$|[?!.])")
@@ -74,7 +93,10 @@ def _utc_day() -> str:
 
 
 def _add_usage(u: dict) -> None:
-    n = u.get("prompt_tokens", 0) * NEURONS_PER_TOKEN[0] + u.get("completion_tokens", 0) * NEURONS_PER_TOKEN[1]
+    # Cloudflare 응답에 실제 뉴런 수가 오면 그걸 쓴다(그림이 들어가면 토큰 셈과 다를 수 있음). 없으면 토큰 수로 계산
+    n = u.get("neurons")
+    if not isinstance(n, (int, float)):
+        n = u.get("prompt_tokens", 0) * NEURONS_PER_TOKEN[0] + u.get("completion_tokens", 0) * NEURONS_PER_TOKEN[1]
     with _usage_lock:
         if _usage["day"] != _utc_day():
             _usage.update(day=_utc_day(), self=0.0, cf=None)
@@ -186,10 +208,90 @@ def _call(messages: list) -> dict:
         raise Busy() from e
 
 
-def reply(text: str, history: list):
-    """(답, 위키 근거 주소 또는 None). history는 app.py의 Turn 목록(role, content)."""
-    ctx = wiki_context(text) if USE_WIKI_CONTEXT else None
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "")}]
+def _field(x, k):
+    return (x.get(k) if isinstance(x, dict) else getattr(x, k, "")) or ""
+
+
+def _content(text: str, images, files):
+    """사용자 차례 내용: 파일은 글자로 앞에 붙이고, 그림이 있으면 OpenAI 형식 배열(글 + image_url)로."""
+    body = text
+    if files:
+        left, parts = MAX_FILE_CHARS, []
+        for f in files:
+            name, t = _field(f, "name")[:120] or "파일", _field(f, "text")
+            if left <= 0:
+                parts.append(f"[첨부 파일: {name}] (글자 수 한도를 넘어 생략)")
+                continue
+            cut = t[:left]
+            left -= len(cut)
+            parts.append(f"[첨부 파일: {name}]\n{cut}" + ("\n…(이하 생략)" if len(cut) < len(t) else ""))
+        body = "\n\n".join(parts) + f"\n\n위 첨부 파일을 참고해서 답해.\n질문: {text}"
+    if not images:
+        return body
+    return [{"type": "text", "text": body}] + [{"type": "image_url", "image_url": {"url": u}} for u in images[:MAX_IMAGES]]
+
+
+def _search_note(q: str, found: list, start: int) -> str:
+    if not found:
+        return "검색이 지금 안 돼서 결과를 받지 못했어. 검색 없이 아는 범위에서 답하고, 최신 정보는 확실하지 않다고 말해. <<search>>는 다시 쓰지 마."
+    lines = []
+    for i, x in enumerate(found, start + 1):
+        s = f"[{i}] {x['title']} — {x['url']}\n{x['snippet']}"
+        if x.get("page"):
+            s += f"\n본문 일부: {x['page']}"
+        lines.append(s)
+    return (f"웹 검색 결과 (검색어: {q}, 오늘 {today_kst()}):\n\n" + "\n\n".join(lines) +
+            "\n\n위 검색 결과를 바탕으로 원래 질문에 자연스럽게 답해. 결과에 없는 내용은 지어내지 말고, 근거로 쓴 결과의 번호를 문장 끝에 [1]처럼 붙여. "
+            "결과가 질문과 관련 없으면 찾지 못했다고 솔직히 말해. <<search>>는 다시 쓰지 마.")
+
+
+def reply(text: str, history: list, images=None, files=None):
+    """(답, 덧붙일 정보 또는 None). 덧붙일 정보 = {"sources": [{title, url}], "searched": 검색어}.
+    history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}]."""
+    system = SYSTEM_PROMPT + f" 오늘은 한국 시각으로 {today_kst()}이야." + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "")
+    msgs = [{"role": "system", "content": system}]
+    for h in history[-HISTORY_TURNS:]:
+        msgs.append({"role": h.role, "content": h.content[:600]})
+    msgs.append({"role": "user", "content": _content(text, images, files)})
+    out = clean(_call(msgs)["choices"][0]["message"]["content"] or "")
+    extra, calcs, searched = {}, 0, False
+    for _ in range(3):  # 도구는 한 질문에 검색 1번 + 계산 2번까지
+        ms = SEARCH_TAG.search(out) if USE_SEARCH and not searched else None
+        mc = CALC_TAG.search(out) if USE_CALC and calcs < 2 else None
+        if ms:
+            searched = True
+            q = ms.group(1).strip()[:120]
+            found = web_search.search(q)
+            note = _search_note(q, found, len(extra.get("sources", [])))
+            if found:
+                extra.setdefault("sources", []).extend({"title": x["title"], "url": x["url"]} for x in found)
+                extra["searched"] = q
+            msgs += [{"role": "assistant", "content": ms.group(0)}, {"role": "user", "content": note}]
+        elif mc:
+            calcs += 1
+            expr = mc.group(1).strip()
+            try:
+                note = f"계산 결과: {expr} = {calc_tool.calc(expr)}"
+                log(f"계산기: {expr[:60]} 성공")
+            except Exception as e:  # noqa: BLE001 — 계산기가 못 하는 식
+                note = f"계산기가 이 식을 계산하지 못했어({e}). 계산 없이 아는 범위에서 답하고, 확실하지 않으면 정확히는 모른다고 해."
+                log(f"계산기: {expr[:60]} 실패 {type(e).__name__}")
+            msgs += [{"role": "assistant", "content": mc.group(0)},
+                     {"role": "user", "content": note + "\n이 결과로 원래 질문에 자연스럽게 답해. 숫자는 계산 결과에 적힌 그대로 옮겨 적고 쉼표를 새로 넣지 마"
+                                                        "(긴 수에 쉼표를 넣다가 끝자리가 망가진 일이 있음). <<calc>>는 다시 쓰지 마."}]
+        else:
+            break
+        out = clean(_call(msgs)["choices"][0]["message"]["content"] or "")
+    out = ANY_TAG.sub("", out).strip()  # 혹시 남은 도구 표시는 지움
+    if STRAY.search(out):  # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움)
+        out = STRAY.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or "")).strip()
+    return (out or "..."), (extra or None)
+
+
+def reply_old_wiki(text: str, history: list):
+    """예전 위키 참고 자료 방식 (USE_WIKI_CONTEXT=True일 때만 쓰던 것, 지금은 안 씀 — 기록용)."""
+    ctx = wiki_context(text)
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in history[-HISTORY_TURNS:]:
         msgs.append({"role": h.role, "content": h.content[:600]})
     if ctx:

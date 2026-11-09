@@ -55,6 +55,7 @@ PROMPT_HISTORY = 4       # 그중 모델에 넣는 건 최근 2번 주고받은 
 TEACH_PAIRS_URL = os.environ.get("TEACH_PAIRS_URL", "https://poem-defog-septum.ngrok-free.dev/teach/pairs")
 TEACH_REFRESH_SEC = 300
 MAX_BODY_BYTES = 16384   # 요청 본문 상한 (질문 200자 + 앞 대화 20개)
+MAX_CHAT_BODY_BYTES = 6_000_000  # /chat 상한: Gemma 4 그림(페이지가 줄여 보내 장당 보통 0.1~0.5MB)·파일 첨부
 MAX_NEW_TOKENS = 80      # 답 자리. 답은 보통 20~40토큰이라 80이면 충분 → 그만큼 앞 대화를 더 넣는다(256 중 176, 2026-10-21)
 MAX_IN_FLIGHT = 3        # 답 만드는 중 1개 + 기다리는 2개까지. 넘치면 바로 "잠시 후"
 TEMPERATURE = 0.6        # 평가(2026-10-19)에서 0.5~0.6이 0.7보다 조금 나았음
@@ -270,7 +271,9 @@ async def limit_body(request: Request, call_next):
     # 본문을 읽기 전에 크기로 거른다. 길이 표시가 없는 POST(chunked)도 막는다.
     if request.method == "POST":
         length = request.headers.get("content-length", "")
-        if not length.isdigit() or int(length) > MAX_BODY_BYTES:
+        # /chat은 그림·파일 첨부(그림 4장 + 파일 글자 3만) 때문에 크게, 나머지는 그대로 작게 (2026-11-09)
+        limit = MAX_CHAT_BODY_BYTES if request.url.path == "/chat" else MAX_BODY_BYTES
+        if not length.isdigit() or int(length) > limit:
             return JSONResponse({"detail": "요청이 너무 큼"}, status_code=413)
     return await call_next(request)
 
@@ -306,10 +309,24 @@ class Turn(BaseModel):
     content: str = Field(max_length=MAX_INPUT_CHARS * 2)
 
 
+class FileIn(BaseModel):
+    # 첨부 파일은 페이지가 글자로 읽어서 보낸다(PDF도 페이지에서 글자만 뽑음) (2026-11-09)
+    name: str = Field(default="", max_length=120)
+    text: str = Field(default="", max_length=40000)
+
+
 class ChatIn(BaseModel):
     message: str = Field(max_length=MAX_INPUT_CHARS * 4)
     model: str = Field(default="latest", max_length=32)
     history: list[Turn] = Field(default_factory=list, max_length=MAX_HISTORY)
+    # 그림 첨부: 페이지가 긴 변 1280px JPEG로 줄인 data URL (Gemma 4만, 2026-11-09 사용자 요청)
+    images: list[str] = Field(default_factory=list, max_length=4)
+    files: list[FileIn] = Field(default_factory=list, max_length=5)
+
+
+IMAGE_URL = re.compile(r"^data:image/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$")
+MAX_IMAGE_CHARS = 2_500_000  # data URL 하나 2.5MB까지 (페이지는 보통 100~400KB로 줄여 보냄)
+ATTACH_DEFAULT = "첨부한 내용을 살펴보고 설명해 줘"
 
 
 def model_list() -> list:
@@ -359,6 +376,15 @@ def chat(body: ChatIn, request: Request):
     if len(body.message) > MAX_INPUT_CHARS * 2:
         raise HTTPException(status_code=400, detail=f"{MAX_INPUT_CHARS}자 이하로")
     text = " ".join(body.message.split())
+    attached = bool(body.images or body.files)
+    if attached:
+        if body.model != GEMMA_KEY:
+            raise HTTPException(status_code=400, detail="그림·파일 첨부는 Gemma 4에서만 할 수 있어요")
+        for u in body.images:
+            if len(u) > MAX_IMAGE_CHARS or not IMAGE_URL.match(u):
+                raise HTTPException(status_code=400, detail="그림 파일을 읽을 수 없어요 (jpg·png·webp·gif, 큰 그림은 줄여서)")
+        if not text:
+            text = ATTACH_DEFAULT  # 그림만 올리고 말없이 보내도 설명해 주기
     if not text:
         raise HTTPException(status_code=400, detail="빈 메시지")
     if len(text) > MAX_INPUT_CHARS:
@@ -373,7 +399,7 @@ def chat(body: ChatIn, request: Request):
         answer = taught.get(teach_norm(text)) if body.model == "latest" else None
         # 지식 질문 → 위키백과 요약(+출처). Gemma 4는 위키 첫 문장보다 스스로 더 잘 답해서 건너뜀(2026-11-08 사용자: "위키 때문에 멍청해 보인다")
         wiki = None if answer or body.model == GEMMA_KEY else wiki_search.lookup(text)
-        grounded = None
+        extra = None  # Gemma 4 웹 검색 출처 {"sources": [...], "searched": 검색어}
         if answer:
             reply, kept = answer, 0
         elif wiki:
@@ -382,7 +408,8 @@ def chat(body: ChatIn, request: Request):
             if not cf_chat.ready():
                 raise HTTPException(status_code=400, detail="없는 모델")
             try:
-                reply, grounded = cf_chat.reply(text, body.history)
+                # 그림·파일 첨부와 웹 검색은 Gemma 4만 (2026-11-09 사용자 요청)
+                reply, extra = cf_chat.reply(text, body.history, body.images, body.files)
             except cf_chat.Busy:
                 # 503이면 페이지가 서버 전체를 '꺼짐'으로 보여 준다 → 429(잠시 후 다시)로. 무료 사용량은 매일 오전 9시에 다시 채워짐
                 q = cf_chat.usage()
@@ -395,15 +422,22 @@ def chat(body: ChatIn, request: Request):
             reply, kept = make_reply(m, body.history, text)
     finally:
         in_flight.release()
-    kind = " (가르친 답)" if answer else " (위키백과)" if wiki else " (위키 근거)" if grounded else ""
+    kind = " (가르친 답)" if answer else " (위키백과)" if wiki else ""
+    if attached:
+        kind += f" [그림 {len(body.images)}·파일 {len(body.files)}]"
+    if extra and extra.get("searched"):
+        kind += f" [검색 {len(extra.get('sources', []))}건]"  # 검색어는 방문자가 쓴 말이라 로그에 남기지 않는다
     log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{kind} ({time.time() - t0:.1f}초)")
     out = {"reply": reply, "kept_turns": kept}
     if answer:
         out["taught"] = True
     if wiki:
         out["source"] = wiki["url"]
-    if grounded:
-        out["grounded"] = grounded  # 페이지는 source가 있으면 '위키백과 답' 카드로 그리므로 근거 주소는 따로 둔다
+    if extra:
+        # 페이지는 source가 있으면 '위키백과 답' 카드로 그리므로 웹 검색 출처는 sources(목록)로 따로 준다
+        out["sources"] = extra.get("sources", [])[:10]
+        if extra.get("searched"):
+            out["searched"] = extra["searched"]
     if body.model == GEMMA_KEY:
         out["quota"] = cf_chat.usage()  # 페이지가 '오늘 남은 사용량'을 바로 고침
     return out
