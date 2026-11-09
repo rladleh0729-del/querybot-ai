@@ -62,7 +62,11 @@ def _bing(q: str) -> list:
     with urllib.request.urlopen(req, timeout=6) as r:
         b = r.read().decode("utf-8", "replace")
     out = []
-    for blk in re.findall(r'<li class="b_algo"(.*?)</li>', b, re.S):
+    # Render(해외 서버)에서는 결과 칸 class에 다른 이름이 더 붙어 와서 0건이 됨(2026-11-09) → 'b_algo'로 시작하는 class 모두
+    blocks = re.findall(r'<li[^>]*class="b_algo[^"]*"[^>]*>(.*?)</li>', b, re.S)
+    if not blocks:  # 그래도 없으면 제목(h2 안의 바깥 링크)만이라도
+        blocks = re.findall(r'(<h2[^>]*>\s*<a[^>]+href="https?://(?!www\.bing\.com|go\.microsoft)[^"]+"[^>]*>.*?</a>.*?)(?=<h2|$)', b, re.S)[:10]
+    for blk in blocks:
         m = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', blk, re.S)
         if not m:
             continue
@@ -78,8 +82,9 @@ def _bing(q: str) -> list:
             continue
         sn = re.search(r"<p[^>]*>(.*?)</p>", blk, re.S)
         out.append({"title": _strip(m.group(2))[:120], "url": u, "snippet": _strip(sn.group(1) if sn else "")[:400]})
-    if not out and ("captcha" in b.lower() or len(b) < 20000):
-        raise RuntimeError(f"Bing 결과 없음({len(b)}바이트)")
+    if not out:  # 왜 0건인지 로그로 알 수 있게 (검색어·본문은 남기지 않고 숫자만)
+        raise RuntimeError(f"Bing 0건({len(b)}바이트, b_algo {b.count('b_algo')}, h2 {b.count('<h2')}, "
+                           f"captcha {int('captcha' in b.lower())}, ck/a {b.count('bing.com/ck/a')})")
     return out
 
 
