@@ -1,7 +1,7 @@
 """웹 검색 (2026-11-09 사용자 요청: "검색 기능도") — Gemma 4가 <<search: 검색어>>를 내면 cf_chat이 부른다.
 
-- 기본: Bing 검색 페이지(열쇠 없음, PC 0.3초·10건). DuckDuckGo는 Render에서 응답이 없어(2026-11-09) 예비로만.
-- 환경변수 TAVILY_API_KEY(무료 월 1,000번) 또는 BRAVE_API_KEY가 있으면 그쪽을 먼저 쓴다.
+- 열쇠가 있으면 먼저: KAKAO_REST_API_KEY(카카오 Daum 웹문서 검색, 무료 하루 30,000건) → TAVILY_API_KEY(월 1,000번) → BRAVE_API_KEY.
+- 열쇠 없이: Bing 검색 페이지(PC 0.3초·10건, Render에서는 모양이 달라 링크에서 직접 뽑음) → DuckDuckGo(Render에서는 자주 봇 확인으로 막힘).
 - 결과 위 2개는 본문도 조금 읽어 온다(요약만으로는 답이 얕아서). 전체 4초 안팎.
 - 같은 검색어는 10분 동안 기억(같은 질문 반복에 검색을 또 하지 않게).
 """
@@ -16,6 +16,7 @@ import time
 import urllib.parse
 import urllib.request
 
+KAKAO_KEY = os.environ.get("KAKAO_REST_API_KEY", "").strip()
 TAVILY_KEY = os.environ.get("TAVILY_API_KEY", "").strip()
 BRAVE_KEY = os.environ.get("BRAVE_API_KEY", "").strip()
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
@@ -82,10 +83,40 @@ def _bing(q: str) -> list:
             continue
         sn = re.search(r"<p[^>]*>(.*?)</p>", blk, re.S)
         out.append({"title": _strip(m.group(2))[:120], "url": u, "snippet": _strip(sn.group(1) if sn else "")[:400]})
+    if not out:
+        # Render에서는 b_algo·h2 없이 클릭 추적 링크(ck/a)만 다른 모양으로 옴(2026-11-09 로그: b_algo 0, h2 0, ck/a 10) → 링크에서 직접 뽑는다
+        seen = set()
+        for m in re.finditer(r'<a[^>]+href="(https://www\.bing\.com/ck/a\?[^"]+)"[^>]*>(.*?)</a>(.{0,700})', b, re.S):
+            g = re.search(r"[?&](?:amp;)?u=a1([^&\"]+)", html.unescape(m.group(1)))
+            if not g:
+                continue
+            s = g.group(1) + "=" * (-len(g.group(1)) % 4)
+            try:
+                u = base64.urlsafe_b64decode(s).decode("utf-8")
+            except Exception:  # noqa: BLE001
+                continue
+            title = _strip(m.group(2))
+            host = urllib.parse.urlsplit(u).netloc
+            if not u.startswith("http") or len(title) < 4 or u in seen or re.search(r"(^|\.)(bing|microsoft|msn)\.com$", host):
+                continue
+            seen.add(u)
+            out.append({"title": title[:120], "url": u, "snippet": _strip(m.group(3))[:300]})
+            if len(out) >= 10:
+                break
     if not out:  # 왜 0건인지 로그로 알 수 있게 (검색어·본문은 남기지 않고 숫자만)
         raise RuntimeError(f"Bing 0건({len(b)}바이트, b_algo {b.count('b_algo')}, h2 {b.count('<h2')}, "
                            f"captcha {int('captcha' in b.lower())}, ck/a {b.count('bing.com/ck/a')})")
     return out
+
+
+def _kakao(q: str) -> list:
+    """카카오 Daum 웹문서 검색 (환경변수 KAKAO_REST_API_KEY, 무료 하루 30,000건, 2026-11-09 사용자 추천). 한국어 결과가 가장 좋음."""
+    url = "https://dapi.kakao.com/v2/search/web?" + urllib.parse.urlencode({"query": q, "size": MAX_RESULTS, "sort": "accuracy"})
+    req = urllib.request.Request(url, headers={"Authorization": "KakaoAK " + KAKAO_KEY})
+    with urllib.request.urlopen(req, timeout=6) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    return [{"title": _strip(x.get("title"))[:120], "url": x.get("url") or "", "snippet": _strip(x.get("contents"))[:400]}
+            for x in d.get("documents") or [] if (x.get("url") or "").startswith("http")]
 
 
 def _tavily(q: str) -> list:
@@ -137,7 +168,8 @@ def search(q: str) -> list:
             return hit[1]
     t0 = time.time()
     found, used = [], ""
-    for name, fn, ok in (("tavily", _tavily, TAVILY_KEY), ("brave", _brave, BRAVE_KEY), ("bing", _bing, True), ("ddg", _ddg, True)):
+    for name, fn, ok in (("kakao", _kakao, KAKAO_KEY), ("tavily", _tavily, TAVILY_KEY), ("brave", _brave, BRAVE_KEY),
+                         ("bing", _bing, True), ("ddg", _ddg, True)):
         if not ok:
             continue
         try:
