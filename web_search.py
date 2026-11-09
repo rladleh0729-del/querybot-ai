@@ -1,10 +1,11 @@
 """웹 검색 (2026-11-09 사용자 요청: "검색 기능도") — Gemma 4가 <<search: 검색어>>를 내면 cf_chat이 부른다.
 
-- 기본: DuckDuckGo HTML(열쇠 없음). PC 시험 1초, 한국어 결과·요약 좋음.
-- Render(해외 클라우드)에서 DuckDuckGo가 막히면: 환경변수 TAVILY_API_KEY(무료 월 1,000번) 또는 BRAVE_API_KEY가 있으면 그쪽을 먼저 쓴다.
+- 기본: Bing 검색 페이지(열쇠 없음, PC 0.3초·10건). DuckDuckGo는 Render에서 응답이 없어(2026-11-09) 예비로만.
+- 환경변수 TAVILY_API_KEY(무료 월 1,000번) 또는 BRAVE_API_KEY가 있으면 그쪽을 먼저 쓴다.
 - 결과 위 2개는 본문도 조금 읽어 온다(요약만으로는 답이 얕아서). 전체 4초 안팎.
 - 같은 검색어는 10분 동안 기억(같은 질문 반복에 검색을 또 하지 않게).
 """
+import base64
 import concurrent.futures
 import html
 import json
@@ -38,7 +39,7 @@ def _ddg(q: str) -> list:
     data = urllib.parse.urlencode({"q": q, "kl": "kr-kr"}).encode()
     req = urllib.request.Request("https://html.duckduckgo.com/html/", data=data,
                                  headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=8) as r:
+    with urllib.request.urlopen(req, timeout=5) as r:
         b = r.read().decode("utf-8", "replace")
     out = []
     for m in re.finditer(r'<a rel="nofollow" class="result__a" href="([^"]+)">(.*?)</a>.*?<a class="result__snippet"[^>]*>(.*?)</a>', b, re.S):
@@ -51,6 +52,34 @@ def _ddg(q: str) -> list:
         out.append({"title": _strip(m.group(2))[:120], "url": u, "snippet": _strip(m.group(3))[:400]})
     if not out and ("anomaly" in b or "captcha" in b.lower()):
         raise RuntimeError("DuckDuckGo 차단(봇 확인)")
+    return out
+
+
+def _bing(q: str) -> list:
+    """Bing 검색 페이지(열쇠 없음). Render(해외 클라우드)에서 DuckDuckGo가 응답하지 않아(8초 시간 초과, 2026-11-09) 기본으로 씀."""
+    url = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": q, "setlang": "ko", "cc": "KR", "count": 10})
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8", "Accept": "text/html"})
+    with urllib.request.urlopen(req, timeout=6) as r:
+        b = r.read().decode("utf-8", "replace")
+    out = []
+    for blk in re.findall(r'<li class="b_algo"(.*?)</li>', b, re.S):
+        m = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', blk, re.S)
+        if not m:
+            continue
+        u = html.unescape(m.group(1))
+        g = re.search(r"[?&]u=a1([^&]+)", u)
+        if "bing.com/ck/a" in u and g:  # 클릭 추적 주소면 원래 주소를 꺼낸다
+            s = g.group(1) + "=" * (-len(g.group(1)) % 4)
+            try:
+                u = base64.urlsafe_b64decode(s).decode("utf-8")
+            except Exception:  # noqa: BLE001
+                continue
+        if not u.startswith("http"):
+            continue
+        sn = re.search(r"<p[^>]*>(.*?)</p>", blk, re.S)
+        out.append({"title": _strip(m.group(2))[:120], "url": u, "snippet": _strip(sn.group(1) if sn else "")[:400]})
+    if not out and ("captcha" in b.lower() or len(b) < 20000):
+        raise RuntimeError(f"Bing 결과 없음({len(b)}바이트)")
     return out
 
 
@@ -103,7 +132,7 @@ def search(q: str) -> list:
             return hit[1]
     t0 = time.time()
     found, used = [], ""
-    for name, fn, ok in (("tavily", _tavily, TAVILY_KEY), ("brave", _brave, BRAVE_KEY), ("ddg", _ddg, True)):
+    for name, fn, ok in (("tavily", _tavily, TAVILY_KEY), ("brave", _brave, BRAVE_KEY), ("bing", _bing, True), ("ddg", _ddg, True)):
         if not ok:
             continue
         try:
