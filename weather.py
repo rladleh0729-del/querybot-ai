@@ -275,15 +275,19 @@ def report(place: str = "", lat=None, lon=None):
     today = datetime.datetime.now(KST).date()
     lines = [f"[날씨 도구 결과] 위치: {label} (위도 {round(lat, 2)}, 경도 {round(lon, 2)}), 자료: {src_title}, 한국 시각 기준"]
     if c:
-        lines.append(f"지금({c['time']}): {c['desc']}, 기온 {c['temp']}°C (체감 {c['feels']}°C), 습도 {c['hum']}%, 바람 {c['wind']}km/h, 강수 {c['prec']}mm")
+        # 비가 0이면 숫자 대신 말로 ("강수량은 0.0mm라고 해요"보다 "비 소식은 없어요"가 자연스러움 — 2026-11-09 사용자)
+        now_rain = "지금 비·눈 안 옴" if not c.get("prec") else f"지금 비·눈 {c['prec']}mm/시간"
+        lines.append(f"지금({c['time']}): {c['desc']}, 기온 {c['temp']}°C (체감 {c['feels']}°C), 습도 {c['hum']}%, 바람 {c['wind']}km/h, {now_rain}")
     for d in w["days"]:
         dd = datetime.date.fromisoformat(d["date"])
         rel = {0: "오늘", 1: "내일", 2: "모레"}.get((dd - today).days, "")
         pop = "" if d.get("pop") is None else f"강수확률 {d['pop']}%, "
-        lines.append(f"{dd.month}월 {dd.day}일({WEEK[dd.weekday()]}{', ' + rel if rel else ''}): {d['desc']}, 최저 {d['tmin']}°C / 최고 {d['tmax']}°C, "
-                     f"{pop}강수량 {d['psum']}mm")
+        rain = "비·눈 소식 없음" if (d.get("psum") or 0) < 0.1 and (d.get("pop") or 0) < 30 else f"{pop}강수량 {d['psum']}mm"
+        lines.append(f"{dd.month}월 {dd.day}일({WEEK[dd.weekday()]}{', ' + rel if rel else ''}): {d['desc']}, 최저 {d['tmin']}°C / 최고 {d['tmax']}°C, {rain}")
     log(f"{w['src']} 예보 {len(w['days'])}일 ({time.time() - t0:.1f}초)")
-    note = "\n".join(lines) + ("\n\n위 날씨 자료로 원래 질문에 자연스럽게 답해. 어느 지역·어느 날 기준인지 함께 말하고, 숫자는 자료 그대로 써. "
+    note = "\n".join(lines) + ("\n\n위 날씨 자료로 원래 질문에 사람이 말하듯 자연스럽게 답해. 어느 지역·어느 날 기준인지 함께 말하고, 기온 숫자는 자료 그대로 써. "
+                               "'강수량 0.0mm'처럼 0인 숫자를 읽어 주지 말고 '비 소식은 없어요'처럼 말해. 습도·바람·강수량 숫자는 물었거나 의미 있을 때(비가 오거나 바람이 셀 때)만 말해. "
+                               "날씨에 맞는 짧은 한마디(겉옷·우산 등)를 붙여도 좋아. "
                                "사용자가 이 자료에 없는 것(미세먼지 등)을 물었을 때만 지어내지 말고 이 자료에는 없다고 말해(묻지 않았으면 꺼내지 마). "
                                "출처 번호는 붙이지 마. <<weather>>는 다시 쓰지 마.")
     return note, {"title": f"{src_title} · {label}", "url": src_url}
