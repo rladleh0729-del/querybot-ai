@@ -387,6 +387,25 @@ def taught_refresh(request: Request):
     return {"updated": taught_info["updated"], "count": taught_info["count"]}
 
 
+class TitleIn(BaseModel):
+    message: str = Field(max_length=1500)
+    reply: str = Field(default="", max_length=1500)
+
+
+@app.post("/title")
+def make_title(body: TitleIn, request: Request):
+    # 대화 목록 제목: Gemma 4가 첫 말의 중심 내용을 짧게 (2026-11-10 사용자 요청). 안 되면 빈 제목 → 페이지는 첫 말 그대로
+    check_rate_limit(client_ip(request))
+    if not cf_chat.ready():
+        return {"title": ""}
+    try:
+        title = cf_chat.make_title(body.message, body.reply)
+    except Exception:  # noqa: BLE001 — 제목은 없어도 되는 것
+        title = ""
+    log(f"[제목] 질문 {len(body.message)}자 → 제목 {len(title)}자")  # 제목·질문 내용은 남기지 않는다
+    return {"title": title}
+
+
 @app.post("/chat")
 def chat(body: ChatIn, request: Request):
     # 글자 수 제한 없음 (2026-11-10). Gemma 4는 줄바꿈을 살려서(코드·긴 글), 기본 모델은 한 줄로 펴서 앞부분만

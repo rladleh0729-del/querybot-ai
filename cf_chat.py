@@ -400,6 +400,38 @@ def _think_summary(reasoning: str, text: str = "") -> str:
         return ""
 
 
+def make_title(message: str, reply: str = "") -> str:
+    """대화 목록 제목 (2026-11-10 사용자: "보낸 채팅 그대로 하면 더러우니까 다른 회사들처럼 중심 내용을 제목으로").
+    message = 지금까지 사용자가 한 말(최근 3개, 첨부 이름 포함), reply = 마지막 답 앞부분.
+    인사·잡담뿐이면 빈 글(페이지는 '새 대화'로 두고 다음 주고받기에서 다시). 질문이 모호하면('풀어봐') 답·첨부에서 주제를 찾는다."""
+    message, reply = message.strip()[:1500], reply.strip()[:700]
+    if not message:
+        return ""
+    if HANGUL.search(message):
+        how = ("in Korean, as a short noun phrase of about 6-16 Korean characters, not a sentence. "
+               "Examples: '내일 서울 강수 예보', '분수 지수 계산', '파이썬으로 1~100 합계 구하기', '이순신 장군 생애', '삼차함수 f(3) 구하기'")
+    else:
+        how = ("in the same language as the user's messages, at most 6 words. "
+               "Examples: 'Sum of 1 to 100 in Python', 'Tomorrow's Rain Forecast in Seoul'")
+    system = ("You name conversations for a chat history list. Read what the user said (and the start of the reply) and write a title "
+              "that tells the main topic at a glance. If the user's words are vague (like 'solve it' or '풀어봐'), take the topic from the "
+              "attachment names and the reply. Keep the key words that tell this chat apart (e.g. Python, Seoul, fractional exponents). "
+              "Do not copy the message word for word. Write the title " + how + ". "
+              "If the conversation is only greetings or small talk with no topic yet (e.g. hi, thanks, how are you), output exactly NONE. "
+              "Output only the title on one line: no quotes, no period, no emoji, no markdown, no LaTeX, no 'Title:' prefix.")
+    user = "USER SAID:\n" + message + ("\n\nREPLY (start):\n" + reply if reply else "")
+    try:
+        d = _call([{"role": "system", "content": system}, {"role": "user", "content": user}], max_tokens=40)
+    except Busy:
+        return ""
+    t = (clean(d["choices"][0]["message"]["content"] or "").strip().split("\n") or [""])[0]
+    t = re.sub(r"^(제목|title)\s*[:：]\s*", "", t, flags=re.I)
+    t = re.sub(r"[*_`#$\\]", "", t).strip(" \"'“”‘’「」『』.。")
+    if not t or re.fullmatch(r"none|없음", t, re.I):
+        return ""
+    return t[:40]
+
+
 def _finish(msgs: list, d: dict, out: str) -> str:
     """답이 한도에 걸려 끊겼으면(finish_reason == "length") 끊긴 자리부터 이어 쓰게 해서 붙인다. 그래도 끊기면 끝에 표시."""
     fin = d["choices"][0].get("finish_reason") or ""
