@@ -10,6 +10,7 @@
 """
 import datetime
 import json
+import re
 import os
 import ssl
 import threading
@@ -38,6 +39,19 @@ _lock = threading.Lock()
 _osm_lock = threading.Lock()
 _osm_last = [0.0]
 _om_block = [0.0]  # Open-Meteo가 막힌 시각 (30분 동안은 바로 MET Norway로)
+# 주요 도시는 좌표를 미리 (2026-11-10: Render에서 Nominatim이 '서울'을 못 찾고 그 실패가 하루 동안 저장돼 '어느 지역?'만 되물음)
+KNOWN = {
+    "서울": (37.5665, 126.9780, "서울특별시"), "부산": (35.1796, 129.0756, "부산광역시"), "대구": (35.8714, 128.6014, "대구광역시"),
+    "인천": (37.4563, 126.7052, "인천광역시"), "광주": (35.1595, 126.8526, "광주광역시"), "대전": (36.3504, 127.3845, "대전광역시"),
+    "울산": (35.5384, 129.3114, "울산광역시"), "세종": (36.4800, 127.2890, "세종특별자치시"), "제주": (33.4996, 126.5312, "제주특별자치도 제주시"),
+    "제주도": (33.4996, 126.5312, "제주특별자치도 제주시"), "서귀포": (33.2541, 126.5601, "제주특별자치도 서귀포시"),
+    "수원": (37.2636, 127.0286, "경기도 수원시"), "성남": (37.4200, 127.1267, "경기도 성남시"), "고양": (37.6584, 126.8320, "경기도 고양시"),
+    "용인": (37.2411, 127.1776, "경기도 용인시"), "창원": (35.2280, 128.6811, "경상남도 창원시"), "청주": (36.6424, 127.4890, "충청북도 청주시"),
+    "전주": (35.8242, 127.1480, "전북특별자치도 전주시"), "천안": (36.8151, 127.1139, "충청남도 천안시"), "포항": (36.0190, 129.3435, "경상북도 포항시"),
+    "춘천": (37.8813, 127.7298, "강원특별자치도 춘천시"), "강릉": (37.7519, 128.8761, "강원특별자치도 강릉시"), "여수": (34.7604, 127.6622, "전라남도 여수시"),
+    "경주": (35.8562, 129.2247, "경상북도 경주시"), "김해": (35.2285, 128.8894, "경상남도 김해시"), "원주": (37.3422, 127.9202, "강원특별자치도 원주시"),
+    "목포": (34.8118, 126.3922, "전라남도 목포시"), "안동": (36.5684, 128.7294, "경상북도 안동시"),
+}
 try:  # PC의 파이썬은 인증서 목록이 모자라 api.met.no 연결이 실패한 일이 있어 certifi가 있으면 그걸 쓴다
     import certifi
     _SSL = ssl.create_default_context(cafile=certifi.where())
@@ -63,7 +77,7 @@ def _cached(key, ttl, fn):
             return hit[1]
     val = fn()
     with _lock:
-        _cache[key] = (time.time(), val)
+        _cache[key] = (time.time() if val is not None else time.time() - ttl + 60, val)  # 실패는 1분만
         if len(_cache) > 500:
             for k in sorted(_cache, key=lambda k: _cache[k][0])[:100]:
                 del _cache[k]
@@ -112,6 +126,9 @@ def geocode(place: str):
     place = " ".join((place or "").split())[:60]
     if not place:
         return None
+    k = re.sub(r"(특별자치시|특별자치도|특별시|광역시|시)$", "", place.replace(" ", ""))
+    if k in KNOWN:  # 주요 도시는 바로
+        return KNOWN[k]
 
     def find():
         try:
@@ -130,7 +147,13 @@ def geocode(place: str):
             except Exception as e:  # noqa: BLE001
                 log(f"카카오 지명 찾기 실패: {type(e).__name__} {str(e)[:50]}")
         return None
-    return _cached(("geo", place), 86400, find)
+    g = _cached(("geo", place), 86400, find)
+    if g is None:  # '서울 서초구'를 못 찾으면(지명 서비스 시간 초과 등) 앞의 도시라도 — 되묻기만 하지 않게
+        k1 = re.sub(r"(특별자치시|특별자치도|특별시|광역시|시|도)$", "", place.split()[0])
+        if k1 in KNOWN:
+            lat, lon, lab = KNOWN[k1]
+            return lat, lon, lab + " (" + place + " 근처는 못 찾아 도시 전체 기준)"
+    return g
 
 
 def reverse(lat: float, lon: float) -> str:
