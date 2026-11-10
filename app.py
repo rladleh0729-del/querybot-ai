@@ -364,6 +364,7 @@ async def health():
            "taught": {"count": taught_info["count"], "updated": taught_info["updated"]}}
     if cf_chat.ready():
         out["quota"] = cf_chat.usage()  # Gemma 4 오늘 남은 뉴런 (무료 하루 10,000, 한국 오전 9시 초기화)
+        out["gemma"] = cf_chat.status()  # Cloudflare 열쇠가 살아 있는지 {ok, reason} (2026-11-10)
     return out
 
 
@@ -424,13 +425,23 @@ def chat(body: ChatIn, request: Request):
                 # 그림·파일 첨부와 웹 검색은 Gemma 4만 (2026-11-09 사용자 요청)
                 reply, extra = cf_chat.reply(text, body.history, body.images, body.files, think=body.think, memory=body.memory,
                                              location=body.location.model_dump() if body.location else None)
-            except cf_chat.Busy:
-                # 503이면 페이지가 서버 전체를 '꺼짐'으로 보여 준다 → 429(잠시 후 다시)로. 무료 사용량은 매일 오전 9시에 다시 채워짐
+            except cf_chat.Busy as e:
+                # Gemma 4가 안 되면 (열쇠 막힘·오늘 사용량 끝·Cloudflare 오류) 글 질문은 기본 모델이 대신 답한다 — 사이트가 '바빠요'로 멈추지 않게
+                # (2026-11-10 사용자: "최우선으로 고쳐. 항상 서버 깨우면 나오게" — Cloudflare 열쇠가 다시 만들어져 하루 동안 '바빠요'만 나옴)
                 q = cf_chat.usage()
-                msg = ("오늘 Gemma 4 무료 사용량을 다 썼어요. 한국 시각 오전 9시에 다시 채워져요."
-                       if q["left"] <= 0 else "Gemma 4가 잠시 바빠요. 조금 뒤에 다시 시도해 주세요.")
-                raise HTTPException(status_code=429, detail=msg)
-            kept = min(len(body.history), cf_chat.HISTORY_TURNS) // 2
+                if isinstance(e, cf_chat.AuthError):
+                    why = "Gemma 4 연결 열쇠에 문제가 있어서"
+                elif isinstance(e, cf_chat.QuotaError) or q["left"] <= 0:
+                    why = "오늘 Gemma 4 무료 사용량을 다 써서(한국 시각 오전 9시에 다시 채워져요)"
+                else:
+                    why = "Gemma 4가 잠시 응답하지 않아서"
+                if attached:  # 그림·파일은 기본 모델이 못 본다 → 503이면 페이지가 '꺼짐'으로 보여 주므로 429로
+                    raise HTTPException(status_code=429, detail=f"{why} 지금은 그림·파일을 볼 수 없어요. 조금 뒤에 다시 시도해 주세요.")
+                reply, kept = make_reply(get_model("latest"), body.history, text)
+                reply = f"({why} 기본 모델 QueryBot the Best가 대신 답해요.)\n\n{reply}"
+                extra = {"fallback": type(e).__name__}
+            else:
+                kept = min(len(body.history), cf_chat.HISTORY_TURNS) // 2
         else:
             m = get_model(body.model)
             reply, kept = make_reply(m, body.history, text)
@@ -447,6 +458,8 @@ def chat(body: ChatIn, request: Request):
         kind += f" [기억 {len(extra['remember'])}줄]"  # 기억 내용은 남기지 않는다
     if body.location:
         kind += " [위치]"  # 좌표·동네 이름은 남기지 않는다
+    if extra and extra.get("fallback"):
+        kind += f" [Gemma 실패 → 기본 모델: {extra['fallback']}]"
     log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{kind} ({time.time() - t0:.1f}초)")
     out = {"reply": reply, "kept_turns": kept}
     if answer:
@@ -462,6 +475,8 @@ def chat(body: ChatIn, request: Request):
             out["thought"] = extra["thought"]  # {seconds, summary(한국어 요약), asked(사용자가 정한 초)}
         if extra.get("remember"):
             out["remember"] = extra["remember"]  # 페이지가 이 브라우저에 저장할 새 기억
+        if extra.get("fallback"):
+            out["fallback"] = extra["fallback"]  # Gemma 4 대신 기본 모델이 답함 (AuthError·QuotaError·Busy)
     if body.model == GEMMA_KEY:
         out["quota"] = cf_chat.usage()  # 페이지가 '오늘 남은 사용량'을 바로 고침
     return out

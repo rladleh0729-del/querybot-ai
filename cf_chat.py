@@ -182,7 +182,11 @@ def _fetch_cf_usage():
 
 
 def _refresh_usage_loop():
+    last_verify = 0.0
     while True:
+        if time.time() - last_verify > 600:  # 열쇠가 살아 있는지 10분마다 (켜질 때 바로 한 번)
+            verify_token()
+            last_verify = time.time()
         v = _fetch_cf_usage()
         with _usage_lock:
             if _usage["day"] != _utc_day():
@@ -207,7 +211,47 @@ def usage() -> dict:
 
 
 class Busy(Exception):
-    """무료 사용량이 다 찼거나 Cloudflare가 잠시 못 받음 → app.py가 429(잠시 후 다시)로 돌려줌."""
+    """무료 사용량이 다 찼거나 Cloudflare가 잠시 못 받음 → app.py가 기본 모델로 대신 답하거나 429(잠시 후 다시)로 돌려줌."""
+
+
+class AuthError(Busy):
+    """Cloudflare가 열쇠를 거절함(401/403). 2026-11-10: 열쇠가 다시 만들어져(Roll) 옛 값이 막힘 → 사이트가 하루 동안 '잠시 바빠요'만 보임."""
+
+
+class QuotaError(Busy):
+    """오늘 무료 사용량(10,000뉴런)을 다 씀 — 한국 오전 9시에 다시 채워짐."""
+
+
+# 열쇠 상태: 서버가 켜질 때와 10분마다 Cloudflare 열쇠 확인 주소(사용량 안 씀)로 확인, 답할 때 401/403이 오면 바로 '막힘'
+_auth = {"ok": None, "reason": "", "at": 0.0}
+
+
+def verify_token() -> bool:
+    """열쇠가 살아 있는지 (뉴런 안 씀). 결과는 _auth에 남는다."""
+    req = urllib.request.Request("https://api.cloudflare.com/client/v4/user/tokens/verify", headers={"Authorization": "Bearer " + CF_API_TOKEN})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        ok = bool(d.get("success")) and (d.get("result") or {}).get("status") == "active"
+        _set_auth(ok, "" if ok else f"열쇠 상태 {(d.get('result') or {}).get('status')}")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            _set_auth(False, f"열쇠 거절 {e.code}")
+        # 그 밖의 오류(네트워크 등)는 열쇠 탓으로 보지 않는다
+    except Exception:  # noqa: BLE001
+        pass
+    return bool(_auth["ok"])
+
+
+def _set_auth(ok: bool, reason: str = "") -> None:
+    if _auth["ok"] != ok:
+        log("Cloudflare 열쇠 " + ("정상" if ok else f"막힘({reason}) — Render 환경변수 CF_API_TOKEN에 새 열쇠를 넣어야 함"))
+    _auth.update(ok=ok, reason=reason, at=time.time())
+
+
+def status() -> dict:
+    """페이지·/state 표시용 Gemma 4 연결 상태."""
+    return {"ok": _auth["ok"], "reason": _auth["reason"]}
 
 
 def ready() -> bool:
@@ -259,9 +303,17 @@ def _call(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
             with urllib.request.urlopen(req, timeout=THINK_TIMEOUT if think else TIMEOUT) as r:
                 d = json.loads(r.read().decode("utf-8"))
             _add_usage(d.get("usage") or {})
+            if _auth["ok"] is not True:
+                _set_auth(True)
             return d
         except urllib.error.HTTPError as e:
-            log(f"Cloudflare 오류 {e.code}: {e.read().decode('utf-8', 'replace')[:200]}")  # 본문에 열쇠는 없음
+            msg = e.read().decode("utf-8", "replace")[:300]
+            log(f"Cloudflare 오류 {e.code}: {msg[:200]}")  # 본문에 열쇠는 없음
+            if e.code in (401, 403):
+                _set_auth(False, f"열쇠 거절 {e.code}")
+                raise AuthError() from e
+            if e.code == 429 and re.search(r"neuron|allocation|daily|quota|limit", msg, re.I):
+                raise QuotaError() from e
             if e.code >= 500 and attempt < 2:
                 time.sleep(1.5 * (attempt + 1))
                 continue
