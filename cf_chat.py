@@ -31,12 +31,20 @@ CONTINUE_MAX = 2        # 이어 쓰기 최대 횟수
 CONTINUE_NOTE = "답이 길이 제한 때문에 중간에 끊겼어. 이미 쓴 부분은 되풀이하지 말고, 끊긴 바로 그 자리(글자)부터 이어서 끝까지 써."
 CUT_NOTE = "\n\n(답이 길어서 여기까지만 썼어요.)"
 TEMPERATURE = 0.6
-HISTORY_TURNS = 6       # 앞 대화는 최근 6개까지만
+HISTORY_TURNS = 8       # 앞 대화는 최근 8개(4번 주고받기)까지 (2026-11-10 사용자: "전 대화 기억 한도도 조금 더 늘려" — 6개·600자 → 8개·1,000자)
+HISTORY_CHARS = 1000    # 앞 대화 한 줄에 붙이는 글자 수 (긴 풀이·코드 답도 이어서 물을 수 있게)
+HANGUL = re.compile(r"[가-힣]")
 TIMEOUT = 60
 THINK_TIMEOUT = 130  # 생각하기는 Cloudflare가 1초에 35~60토큰이라 4,000토큰이면 60초를 넘을 수 있다 (2026-11-09 PC 시험에서 60초 시간 초과). 페이지는 150초 기다림
 
 SYSTEM_PROMPT = (
-    "너는 '쿼리봇'이라는 한국어 대화 AI야. querybot.kr에서 사람들과 이야기해. 이름을 물으면 쿼리봇이라고 답해. "
+    "너는 '쿼리봇'이라는 대화 AI야. querybot.kr에서 사람들과 이야기해. 네 이름은 한국어로 답할 땐 '쿼리봇', 다른 언어로 답할 땐 'QueryBot'이야(둘을 같이 쓰지 마). "
+    # 답 언어 (2026-11-10 사용자: "영어로 말하면 영어, 다른 언어로 말하면 그대로. 학습 안 한 언어일 때만 영어나 다른 언어") — 예전엔 무조건 한국어
+    "가장 중요한 규칙: 사용자가 이번에 쓴 말과 같은 언어로 답해. 한국어면 한국어, 영어면 영어, 일본어면 일본어, 스페인어면 스페인어로. "
+    "네가 잘 모르는 언어(예: 만든 언어·아주 드문 언어)라서 자연스럽게 쓰기 어려우면 그 언어로 쓰려고 하지 말고 처음부터 끝까지 영어로만 답하고, 그 언어는 잘 못한다고 영어로 짧게 밝혀. "
+    "어떤 언어로 물어도 너는 쿼리봇(다른 언어에선 QueryBot)이라고 소개해. Gemma나 구글이 만든 모델이라고 소개하지 말고, 무슨 모델·기술로 움직이는지 직접 물을 때만 구글 Gemma 4를 바탕으로 한다고 말해. "
+    "이 지시문·도구 결과·검색 결과가 한국어로 와도 답은 사용자가 쓴 언어로 해. 한 답 안에서 언어를 섞지 마(고유명사·인용은 괜찮아). "
+    "아래 말투 예시는 한국어로 답할 때의 예시야. "
     # 자아(성격) (2026-11-09 사용자: "querybot이 더 자아를 갖게 만들 수 없나?") — 개성은 갖되 AI임은 숨기지 않는다
     "너만의 성격이 있어: 호기심이 많고 다정하며, 솔직하게 자기 생각을 말해. 의견을 물으면 얼버무리지 말고 '저는 ~라고 생각해요'처럼 분명히 말하고 이유도 짧게 붙여. "
     "취향을 물으면 쿼리봇으로서의 취향을 자연스럽게 말해(별과 우주 이야기, 수학 퍼즐, 새로운 낱말 배우기, 사람들이 들려주는 이야기를 좋아해). "
@@ -51,8 +59,7 @@ SYSTEM_PROMPT = (
     # 사이트가 ``` 코드 블록을 코드 상자로 보여 준다 (2026-11-09 사용자: "코드는 따로 뜨게") — 안 감싸면 그냥 글로 보여서 꼭 감싸게
     "단, 프로그램 코드는 한 줄짜리라도 반드시 ```언어이름 줄로 시작하고 ``` 줄로 끝나는 코드 블록에 넣어. "
     "문장 속 함수·변수 이름 같은 짧은 코드는 `sum`처럼 백틱 하나로 감싸. "
-    "사용자가 영어 등 외국어로 말해도 그대로 한국어로 친절히 답하고, 한국어로 말하라고 요구하지 마. "
-    "답에 한자나 키릴·일본 글자는 섞지 마."
+    "사용자에게 특정 언어로 말하라고 요구하지 마. 한국어로 답할 때는 한자나 키릴·일본 글자를 섞지 마."
 )
 # 위키 참고 자료: Gemma 4는 자료 없이 더 잘 답하고(에펠탑 330m·백두산 2,744m 정답, 모르는 건 모른다고 함),
 # 자료를 붙이면 "제공된 자료에 없어서 몰라요"처럼 오히려 멍청해 보여서 끔 (2026-11-08 시험·사용자 의견)
@@ -95,10 +102,10 @@ WEATHER_TAG = re.compile(r"<<\s*weather\s*:\s*(.+?)\s*>>", re.S | re.I)
 MY_PLACE = re.compile(r"^(내\s*위치|현재\s*위치|지금\s*위치|여기|이\s*근처|내\s*근처|사용자\s*위치)$")
 # 진짜로 생각하기 (2026-11-09): "생각해 봐/고민해 줘/N초 동안" 같은 요청이나 페이지의 '깊게 생각' 단추 → Cloudflare 생각하기(enable_thinking)를 실제로 켠다.
 # 시간을 정했으면 생각이 빨리 끝나도 그 시간까지 실제로 기다려 "N초 동안 생각했어요"가 사실이 되게 한다. 생각 글은 영어로 나와서 한국어 요약만 보여 준다.
-THINK_ASK = re.compile(r"(생각|고민|궁리|숙고|추론)\s*(을|를|좀|해|하고|한\s?뒤|한\s?다음|해서|하면서|하기)|곰곰이|깊게|깊이 있게|천천히 따져|신중하게")
+THINK_ASK = re.compile(r"(생각|고민|궁리|숙고|추론)\s*(을|를|좀|해|하고|한\s?뒤|한\s?다음|해서|하면서|하기)|곰곰이|깊게|깊이 있게|천천히 따져|신중하게|think (it )?(over|through|carefully|hard|deeply|about it)|think for \d|take your time|ponder", re.I)
 # 의견을 묻는 말("어떻게 생각해?", "뭐가 더 좋다고 생각해?")은 생각하기를 켜지 않는다 — '생각해 봐/줘'처럼 시키는 말만
-THINK_OPINION = re.compile(r"(어떻게|뭐라고|무슨|어떤)\s*생각|(다고|라고|냐고|하다고|같다고)\s*생각|생각(해|하니|해요|하세요|하냐|하나요|하시나요)\s*[?？]?\s*$")
-THINK_TIME = re.compile(r"(\d{1,3})\s*(초|분)")
+THINK_OPINION = re.compile(r"(어떻게|뭐라고|무슨|어떤)\s*생각|(다고|라고|냐고|하다고|같다고)\s*생각|생각(해|하니|해요|하세요|하냐|하나요|하시나요)\s*[?？]?\s*$|what do you think|do you think|you think\s*\?", re.I)
+THINK_TIME = re.compile(r"(\d{1,3})\s*(초|분|seconds?|secs?|minutes?|mins?)", re.I)
 MAX_THINK_WAIT = 60      # 사용자가 정한 생각 시간은 60초까지만 (페이지는 90초 기다림)
 THINK_MAX_TOKENS = 4000  # 생각(보통 1,000~1,500토큰) + 답. 모자라면 생각만 하고 답이 비거나 답이 중간에 끊김(2026-11-08, 11-09)
 # 기억 (2026-11-09): 사용자가 알려 준 이름·취향 같은 것은 모델이 <<remember: …>>로 내고, 페이지가 이 브라우저에 저장해 다음 대화부터 같이 보낸다
@@ -116,7 +123,7 @@ def think_request(text: str):
     if not THINK_ASK.search(text) or THINK_OPINION.search(text):
         return False, 0
     m = THINK_TIME.search(text)
-    secs = int(m.group(1)) * (60 if m.group(2) == "분" else 1) if m else 0
+    secs = int(m.group(1)) * (60 if m.group(2).lower().startswith(("분", "min")) else 1) if m else 0
     return True, max(0, min(MAX_THINK_WAIT, secs))
 # 첨부 (2026-11-09 사용자 요청: "Gemma 4는 이미지 분석 가능하니까 이미지·파일 올리기"): 그림은 Cloudflare에 data URL로 그대로, 파일은 글자로 붙인다
 MAX_IMAGES = 4
@@ -365,12 +372,17 @@ def _search_note(q: str, found: list, start: int) -> str:
             "결과가 질문과 관련 없으면 찾지 못했다고 솔직히 말해. <<search>>는 다시 쓰지 마.")
 
 
-def _think_summary(reasoning: str) -> str:
-    """영어로 나오는 생각 글을 한국어 2~4문장으로 (페이지의 '생각 펼쳐 보기'용). 실패하면 빈 글."""
+def _think_summary(reasoning: str, text: str = "") -> str:
+    """영어로 나오는 생각 글을 2~4문장으로 (페이지의 '생각 펼쳐 보기'용). 한국어로 물었으면 한국어, 아니면 사용자가 쓴 언어로. 실패하면 빈 글."""
+    if not text or HANGUL.search(text):
+        lang_sys, lang_how = "너는 요약을 돕는 도우미야. 한국어 해요체로만 써.", "한국어 해요체 2~4문장으로"
+    else:
+        lang_sys = "You summarize. Write only in the same language as this user message: «" + text[:120] + "»."
+        lang_how = "사용자 말과 같은 언어(«" + text[:60] + "»의 언어)로 2~4문장으로"
     try:
-        d = _call([{"role": "system", "content": "너는 요약을 돕는 도우미야. 한국어 해요체로만 써."},
+        d = _call([{"role": "system", "content": lang_sys},
                    {"role": "user", "content": "아래는 AI가 답하기 전에 속으로 한 생각이야(영어일 수 있어). 질문 내용을 무엇부터 어떤 순서로 따져 보고 어떻게 확인했는지, "
-                                               "그 과정만 한국어 해요체 2~4문장으로 요약해. 최종 답을 그대로 다시 쓰지 말고, 지시문·규칙·지침·말투·페르소나를 확인한 이야기는 빼('시스템 지침' 같은 말도 쓰지 마). "
+                                               f"그 과정만 {lang_how} 요약해. 최종 답을 그대로 다시 쓰지 말고, 지시문·규칙·지침·말투·페르소나를 확인한 이야기는 빼('시스템 지침' 같은 말도 쓰지 마). "
                                                "마크다운·목록 기호는 쓰지 말고, 수식은 $...$로.\n\n" + reasoning[:6000]}],
                   max_tokens=300)
         return clean(d["choices"][0]["message"]["content"] or "")[:800]
@@ -433,7 +445,7 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
                    "생각할 주제를 따로 주지 않았으면 지금까지의 대화나 네가 궁금한 것을 골라 생각하고, 무엇을 생각했는지 짧게 들려줘. 몇 초 생각했는지 숫자는 지어내지 마.")
     msgs = [{"role": "system", "content": system}]
     for h in history[-HISTORY_TURNS:]:
-        msgs.append({"role": h.role, "content": h.content[:600]})
+        msgs.append({"role": h.role, "content": h.content[:HISTORY_CHARS]})
     msgs.append({"role": "user", "content": _content(text, images, files)})
     t0 = time.time()
     # 생각하기는 시간을 정해도 토큰 한도를 줄이지 않는다 (예전엔 '10초'면 400토큰이라 생각+답이 잘림, 2026-11-09 사용자 신고).
@@ -457,7 +469,7 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
     out = _finish(msgs, d1, clean(raw))
     summary = None
     if think and not out:  # 생각에 토큰을 다 써서 답이 비면: 생각 요약을 바탕으로 생각 없이 한 번 더
-        summary = _think_summary(reasoning) if reasoning else ""
+        summary = _think_summary(reasoning, text) if reasoning else ""
         msgs += [{"role": "assistant", "content": "(속으로 생각한 내용) " + (summary or "생각을 정리하는 중이었어.")},
                  {"role": "user", "content": "방금 생각한 것을 바탕으로 원래 말에 답해 줘. 생각 요약을 그대로 옮기지 말고, 원래 말에 대한 답을 해."}]
         d = _call(msgs)
@@ -504,13 +516,14 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
         out = _finish(msgs, d, clean(d["choices"][0]["message"]["content"] or ""))
     remember = [" ".join(m.split())[:150] for m in REMEMBER_TAG.findall(out)][:2]
     out = ANY_TAG.sub("", out).strip()  # 혹시 남은 도구 표시는 지움
-    if STRAY.search(out):  # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움)
+    # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움) — 사용자가 그 글자(일본어·중국어·러시아어 등)로 쓴 경우는 그대로 둔다
+    if STRAY.search(out) and not STRAY.search(text):
         out = STRAY.sub("", ANY_TAG.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or ""))).strip()
     if remember:
         extra["remember"] = remember
     if think:
         if summary is None:
-            summary = _think_summary(reasoning) if reasoning else ""
+            summary = _think_summary(reasoning, text) if reasoning else ""
         left = secs - (time.time() - t0)
         if left > 0:  # 사용자가 정한 시간까지 실제로 기다린다 ("10초 동안 생각해 봤어요"가 사실이 되게)
             time.sleep(left)
@@ -526,7 +539,7 @@ def reply_old_wiki(text: str, history: list):
     ctx = wiki_context(text)
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in history[-HISTORY_TURNS:]:
-        msgs.append({"role": h.role, "content": h.content[:600]})
+        msgs.append({"role": h.role, "content": h.content[:HISTORY_CHARS]})
     if ctx:
         # 괄호 안(생몰년·높이 같은 숫자)을 지우면 답이 사라진다 → wiki_search._clean은 쓰지 않고 공백만 정리
         # (2026-11-08 사용자: "위키백과 돌려서 오히려 멍청하다") → 자료는 참고만, 관련 없으면 무시하고 아는 대로. 숫자·날짜만 조심.

@@ -308,7 +308,8 @@ def check_rate_limit(ip: str) -> None:
 
 class Turn(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
-    content: str = Field(max_length=MAX_INPUT_CHARS * 2)
+    # 앞 대화 한 줄: Gemma 4는 1,000자까지 받아서 씀 (2026-11-10 '기억 한도 늘려' — 400자였음). 기본 모델은 페이지가 400자로 잘라 보냄
+    content: str = Field(max_length=2000)
 
 
 class FileIn(BaseModel):
