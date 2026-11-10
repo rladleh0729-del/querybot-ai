@@ -196,7 +196,8 @@ def _refresh_usage_loop():
             if _usage["cf_ok"] is None or _usage["cf_ok"] != (v is not None):
                 log("오늘 사용량: " + ("Cloudflare 실제 집계 사용" if v is not None else "권한 없음 → 서버가 직접 셈"))
             _usage["cf_ok"] = v is not None
-        time.sleep(60 if v is not None else 600)
+        # 권한이 없을 때도 2분마다 다시 확인 → 열쇠에 'Account Analytics 읽기'를 넣으면 다시 배포하지 않아도 2분 안에 진짜 사용량으로 (2026-11-10)
+        time.sleep(60 if v is not None else 120)
 
 
 def usage() -> dict:
