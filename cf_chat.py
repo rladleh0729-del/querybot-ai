@@ -128,6 +128,7 @@ def think_request(text: str):
     return True, max(0, min(MAX_THINK_WAIT, secs))
 # 첨부 (2026-11-09 사용자 요청: "Gemma 4는 이미지 분석 가능하니까 이미지·파일 올리기"): 그림은 Cloudflare에 data URL로 그대로, 파일은 글자로 붙인다
 MAX_IMAGES = 4
+MAX_TEXT_CHARS = 200000  # 사용자 글 (2026-11-10 '제한 없이'): Gemma 4는 25만 6천 토큰까지 읽음 → 이보다 길면 앞 12만·끝 8만 자만 (가운데 생략 표시)
 MAX_FILE_CHARS = 30000  # 파일 글자 합계 (넘으면 뒷부분 생략) — 약 1만~2만 토큰, 100~200뉴런
 WEEKDAYS = "월화수목금토일"
 
@@ -223,6 +224,10 @@ class Busy(Exception):
     """무료 사용량이 다 찼거나 Cloudflare가 잠시 못 받음 → app.py가 기본 모델로 대신 답하거나 429(잠시 후 다시)로 돌려줌."""
 
 
+class TooLong(Exception):
+    """글이 Gemma 4가 한 번에 읽을 수 있는 길이(25만 6천 토큰)를 넘음 — 기본 모델로 넘기지 않고 사용자에게 나눠 보내 달라고 한다."""
+
+
 class AuthError(Busy):
     """Cloudflare가 열쇠를 거절함(401/403). 2026-11-10: 열쇠가 다시 만들어져(Roll) 옛 값이 막힘 → 사이트가 하루 동안 '잠시 바빠요'만 보임."""
 
@@ -306,10 +311,12 @@ def _call(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
     body = json.dumps({"model": CF_MODEL, "messages": messages, "temperature": TEMPERATURE,
                        "max_tokens": max_tokens or (THINK_MAX_TOKENS if think else MAX_TOKENS),
                        "chat_template_kwargs": {"enable_thinking": think}}).encode("utf-8")
+    # 아주 긴 글은 읽는 데도 시간이 걸린다 → 보내는 크기에 맞춰 기다리는 시간을 늘림 (최대 +120초)
+    wait = (THINK_TIMEOUT if think else TIMEOUT) + min(120, len(body) // 5000)
     for attempt in range(3):  # Cloudflare 쪽 일시 오류(500 AiError 8005 등)는 1.5초·3초 뒤 두 번 더 (2026-11-09 PC·실서버에서 만남 → 사용자에게 '잠시 바빠요')
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "Authorization": "Bearer " + CF_API_TOKEN})
         try:
-            with urllib.request.urlopen(req, timeout=THINK_TIMEOUT if think else TIMEOUT) as r:
+            with urllib.request.urlopen(req, timeout=wait) as r:
                 d = json.loads(r.read().decode("utf-8"))
             _add_usage(d.get("usage") or {})
             if _auth["ok"] is not True:
@@ -323,6 +330,8 @@ def _call(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
                 raise AuthError() from e
             if e.code == 429 and re.search(r"neuron|allocation|daily|quota|limit", msg, re.I):
                 raise QuotaError() from e
+            if e.code in (400, 413) and re.search(r"context|too long|too large|maximum|exceed|tokens", msg, re.I):
+                raise TooLong() from e
             if e.code >= 500 and attempt < 2:
                 time.sleep(1.5 * (attempt + 1))
                 continue
@@ -415,6 +424,9 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
     "thought": {"seconds", "summary", "asked"}, "remember": [새로 기억할 한 줄]}.
     history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}],
     think = 페이지의 '깊게 생각' 단추, memory = 이 브라우저에 저장된 사용자 기억(한 줄씩)."""
+    if len(text) > MAX_TEXT_CHARS:  # 거의 없는 일: 책 한 권 넘는 글 → 앞·끝만 (가운데 생략)
+        cut = len(text) - MAX_TEXT_CHARS
+        text = text[:120000] + f"\n\n…(글이 너무 길어서 가운데 {cut:,}자는 빼고 보냄)…\n\n" + text[-80000:]
     asked, secs = think_request(text)
     think = bool(think or asked)
     # 위치 공유 (2026-11-09): 페이지의 '위치' 단추를 켜면 대략 좌표(소수 둘째 자리 ≈ 1km)가 온다 → 동네 이름으로 바꿔 알려 준다(로그에는 안 남김)

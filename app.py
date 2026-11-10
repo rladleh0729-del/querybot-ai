@@ -48,7 +48,9 @@ EXTRA_MODELS = [
 
 PORT = int(os.environ.get("PORT", "7860"))
 
-MAX_INPUT_CHARS = 200
+MAX_INPUT_CHARS = 200     # 기본 모델·가르친 말·위키백과가 다루는 짧은 질문 길이
+MAX_MESSAGE_CHARS = 1_000_000  # 사용자가 쓰는 글은 사실상 제한 없음 (2026-11-10 사용자: "채팅은 제한 없이. 무한") — 몸통 6MB 한도가 먼저 걸림
+BASIC_INPUT_CHARS = 1000  # 기본 모델은 앞 170토큰쯤만 읽으므로 그 앞부분만 넘긴다
 MAX_HISTORY = 20         # 앞 대화는 최근 20개(10번 주고받기)까지만 받는다
 PROMPT_HISTORY = 4       # 그중 모델에 넣는 건 최근 2번 주고받은 것만 (작은 모델은 앞 대화가 길면 헷갈림, 2026-10-21)
 # 주인이 사이트 '가르치기 모드'로 가르친 대화(PC 답변 서버에 저장)를 몇 분마다 받아 와서, 같은 말엔 바로 그 답을 한다.
@@ -324,7 +326,7 @@ class LocIn(BaseModel):
 
 
 class ChatIn(BaseModel):
-    message: str = Field(max_length=MAX_INPUT_CHARS * 4)
+    message: str = Field(max_length=MAX_MESSAGE_CHARS)
     model: str = Field(default="latest", max_length=32)
     history: list[Turn] = Field(default_factory=list, max_length=MAX_HISTORY)
     # 그림 첨부: 페이지가 긴 변 1280px JPEG로 줄인 data URL (Gemma 4만, 2026-11-09 사용자 요청)
@@ -387,9 +389,13 @@ def taught_refresh(request: Request):
 
 @app.post("/chat")
 def chat(body: ChatIn, request: Request):
-    if len(body.message) > MAX_INPUT_CHARS * 2:
-        raise HTTPException(status_code=400, detail=f"{MAX_INPUT_CHARS}자 이하로")
-    text = " ".join(body.message.split())
+    # 글자 수 제한 없음 (2026-11-10). Gemma 4는 줄바꿈을 살려서(코드·긴 글), 기본 모델은 한 줄로 펴서 앞부분만
+    raw = body.message.replace("\r\n", "\n").replace("\r", "\n")
+    flat = " ".join(raw.split())
+    if body.model == GEMMA_KEY:
+        text = re.sub(r"\n{3,}", "\n\n", "\n".join(line.rstrip() for line in raw.strip().split("\n")))
+    else:
+        text = flat[:BASIC_INPUT_CHARS]
     attached = bool(body.images or body.files)
     if attached:
         if body.model != GEMMA_KEY:
@@ -401,8 +407,6 @@ def chat(body: ChatIn, request: Request):
             text = ATTACH_DEFAULT  # 그림만 올리고 말없이 보내도 설명해 주기
     if not text:
         raise HTTPException(status_code=400, detail="빈 메시지")
-    if len(text) > MAX_INPUT_CHARS:
-        raise HTTPException(status_code=400, detail=f"{MAX_INPUT_CHARS}자 이하로")
     check_rate_limit(client_ip(request))
     slot = gemma_in_flight if body.model == GEMMA_KEY else in_flight
     if not slot.acquire(blocking=False):
@@ -413,7 +417,7 @@ def chat(body: ChatIn, request: Request):
         # 기본 모델로 대화할 때만: 주인이 가르친 말이면 그 답을 바로 (다른 모델을 고른 방문자에겐 그 모델 답 그대로)
         answer = taught.get(teach_norm(text)) if body.model == "latest" else None
         # 지식 질문 → 위키백과 요약(+출처). Gemma 4는 위키 첫 문장보다 스스로 더 잘 답해서 건너뜀(2026-11-08 사용자: "위키 때문에 멍청해 보인다")
-        wiki = None if answer or body.model == GEMMA_KEY else wiki_search.lookup(text)
+        wiki = None if answer or body.model == GEMMA_KEY or len(text) > MAX_INPUT_CHARS else wiki_search.lookup(text)
         extra = None  # Gemma 4 웹 검색 출처 {"sources": [...], "searched": 검색어}
         if answer:
             reply, kept = answer, 0
@@ -426,6 +430,8 @@ def chat(body: ChatIn, request: Request):
                 # 그림·파일 첨부와 웹 검색은 Gemma 4만 (2026-11-09 사용자 요청)
                 reply, extra = cf_chat.reply(text, body.history, body.images, body.files, think=body.think, memory=body.memory,
                                              location=body.location.model_dump() if body.location else None)
+            except cf_chat.TooLong:
+                raise HTTPException(status_code=400, detail="글이 너무 길어서 Gemma 4가 한 번에 다 읽을 수 없어요. 몇 번에 나눠서 보내 주세요.")
             except cf_chat.Busy as e:
                 # Gemma 4가 안 되면 (열쇠 막힘·오늘 사용량 끝·Cloudflare 오류) 글 질문은 기본 모델이 대신 답한다 — 사이트가 '바빠요'로 멈추지 않게
                 # (2026-11-10 사용자: "최우선으로 고쳐. 항상 서버 깨우면 나오게" — Cloudflare 열쇠가 다시 만들어져 하루 동안 '바빠요'만 나옴)
@@ -438,7 +444,7 @@ def chat(body: ChatIn, request: Request):
                     why = "Gemma 4가 잠시 응답하지 않아서"
                 if attached:  # 그림·파일은 기본 모델이 못 본다 → 503이면 페이지가 '꺼짐'으로 보여 주므로 429로
                     raise HTTPException(status_code=429, detail=f"{why} 지금은 그림·파일을 볼 수 없어요. 조금 뒤에 다시 시도해 주세요.")
-                reply, kept = make_reply(get_model("latest"), body.history, text)
+                reply, kept = make_reply(get_model("latest"), body.history, flat[:BASIC_INPUT_CHARS])
                 reply = f"({why} 기본 모델 QueryBot the Best가 대신 답해요.)\n\n{reply}"
                 extra = {"fallback": type(e).__name__}
             else:
