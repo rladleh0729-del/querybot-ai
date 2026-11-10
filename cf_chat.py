@@ -451,7 +451,19 @@ def _finish(msgs: list, d: dict, out: str) -> str:
     return out
 
 
-def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None):
+# 설정 > 사용자 지침의 말투 (2026-11-10 사용자: "사용자 지침 탭 … 말투 선택 가능하게 하고 사용자 지침 넣는 기능도")
+TONES = {
+    "friendly": "말투 설정(앞의 말투 규칙보다 우선): 다정하고 편안하게. 한국어로 답할 땐 부드러운 해요체로, 공감 한마디를 곁들여도 좋아.",
+    "casual": "말투 설정(앞의 말투 규칙보다 우선): 친한 친구처럼 반말로 편하게 말해(한국어일 때 '~야', '~해', '~지'). 다른 언어는 그 언어의 편한 말투로.",
+    "formal": "말투 설정(앞의 말투 규칙보다 우선): 격식 있고 정중하게. 한국어로 답할 땐 '~습니다', '~입니다' 같은 합니다체로.",
+    "brief": "말투 설정(앞의 말투 규칙보다 우선): 핵심만 아주 짧게. 인사·맞장구·덧붙임 없이 1~3문장으로(코드·풀이는 필요한 만큼).",
+    "detailed": "말투 설정(앞의 말투 규칙보다 우선): 자세하고 친절하게. 배경·이유·예시까지 단계별로 충분히 설명해.",
+}
+MAX_INSTR = 1500
+
+
+def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
+          style: str = "", instructions: str = ""):
     """(답, 덧붙일 정보 또는 None). 덧붙일 정보 = {"sources": [{title, url}], "searched": 검색어,
     "thought": {"seconds", "summary", "asked"}, "remember": [새로 기억할 한 줄]}.
     history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}],
@@ -482,6 +494,12 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
     mem = [" ".join(str(m).split())[:150] for m in (memory or []) if str(m).strip()][:MAX_MEMORY]
     if mem:
         system += " 이 사용자에 대해 이 브라우저에 저장된 기억: " + " / ".join(mem) + ". 자연스럽게 활용하되 매번 꺼내 말하지는 마."
+    tone = TONES.get((style or "").strip())
+    if tone:
+        system += " " + tone
+    ins = " ".join(str(instructions or "").split())[:MAX_INSTR]
+    if ins:  # 사용자가 설정에 직접 적은 지침 (안전·정직 규칙과 부딪히면 그 부분만 따르지 않음)
+        system += (" 사용자가 설정의 '사용자 지침'에 직접 적어 둔 내용이야. 안전·정직 규칙과 부딪히지 않는 한 답할 때 꼭 따라: «" + ins + "»")
     system_plain = system  # 생각하기가 실패해 생각 없이 다시 부를 때 쓰는 지시문 ('생각했다'는 말이 없음)
     if think:
         system += (" 이번 답은 실제로 '생각하기' 기능을 켜고 만들어" + (f"지고, 사용자에게는 실제로 {secs}초 넘게 지난 뒤에 보여져" if secs else "져") +

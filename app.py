@@ -337,6 +337,8 @@ class ChatIn(BaseModel):
     memory: list[str] = Field(default_factory=list, max_length=12)
     # 위치 공유 (2026-11-09): 페이지의 '위치' 단추를 켰을 때만, 대략 좌표(소수 둘째 자리). 저장·로그 안 함
     location: LocIn | None = None
+    style: str = Field(default="", max_length=20)          # 설정 > 사용자 지침 > 말투 (Gemma 4만)
+    instructions: str = Field(default="", max_length=1500)  # 설정 > 사용자 지침 (Gemma 4만, 서버에 저장 안 함)
 
 
 IMAGE_URL = re.compile(r"^data:image/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$")
@@ -448,7 +450,8 @@ def chat(body: ChatIn, request: Request):
             try:
                 # 그림·파일 첨부와 웹 검색은 Gemma 4만 (2026-11-09 사용자 요청)
                 reply, extra = cf_chat.reply(text, body.history, body.images, body.files, think=body.think, memory=body.memory,
-                                             location=body.location.model_dump() if body.location else None)
+                                             location=body.location.model_dump() if body.location else None,
+                                             style=body.style, instructions=body.instructions)
             except cf_chat.TooLong:
                 raise HTTPException(status_code=400, detail="글이 너무 길어서 Gemma 4가 한 번에 다 읽을 수 없어요. 몇 번에 나눠서 보내 주세요.")
             except cf_chat.Busy as e:
