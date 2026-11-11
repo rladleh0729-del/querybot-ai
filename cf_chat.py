@@ -315,6 +315,9 @@ def _call_groq(messages: list, think: bool = False, max_tokens: int = 0) -> dict
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 d = json.loads(r.read().decode("utf-8"))
+            u = d.get("usage") or {}
+            cached = ((u.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0
+            log(f"Groq 입력 {u.get('prompt_tokens')}토큰(캐시 {cached}) · 출력 {u.get('completion_tokens')}토큰")
             for c in d.get("choices") or []:  # 생각 글은 'reasoning'으로 옴 → 아래 코드가 읽는 이름으로
                 m = c.get("message") or {}
                 if m.get("reasoning") and not m.get("reasoning_content"):
@@ -532,17 +535,17 @@ MAX_INSTR = 1500
 
 
 def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
-          style: str = "", instructions: str = "", provider: str = "cf"):
-    """provider = "cf"(Gemma 4, Cloudflare) 또는 "groq"(gpt-oss-120b). 나머지는 _reply 설명 그대로."""
+          style: str = "", instructions: str = "", provider: str = "cf", older=None):
+    """provider = "cf"(Gemma 4, Cloudflare) 또는 "groq"(gpt-oss-120b). older = 앞 대화 8개보다 오래된 사용자 말(줄임). 나머지는 _reply 설명 그대로."""
     tok = _provider.set("groq" if provider == "groq" and groq_ready() else "cf")
     try:
-        return _reply(text, history, images, files, think, memory, location, style, instructions)
+        return _reply(text, history, images, files, think, memory, location, style, instructions, older or [])
     finally:
         _provider.reset(tok)
 
 
 def _reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
-           style: str = "", instructions: str = ""):
+           style: str = "", instructions: str = "", older=None):
     """(답, 덧붙일 정보 또는 None). 덧붙일 정보 = {"sources": [{title, url}], "searched": 검색어,
     "thought": {"seconds", "summary", "asked"}, "remember": [새로 기억할 한 줄]}.
     history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}],
@@ -564,14 +567,17 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
         except (TypeError, ValueError):
             loc = None
     if loc:  # 위치를 알면 '지역 없는 날씨 질문 = 내 위치'로 (위치를 켰는데도 지역을 되묻던 일, 2026-11-09 PC 시험)
-        wp = (f" 사용자가 위치 공유를 켰어: 지금 대략 {loc[2] or '알 수 없는 동네'} 근처에 있어(위도 {loc[0]}, 경도 {loc[1]}). "
+        wp = (f" (위치) 사용자가 위치 공유를 켰어: 지금 대략 {loc[2] or '알 수 없는 동네'} 근처에 있어(위도 {loc[0]}, 경도 {loc[1]}). "
               " 날씨·기온·비·눈·바람처럼 날씨를 물으면 웹 검색 말고 답 대신 한 줄로 <<weather: 지역 이름>> 만 써. "
               "지역을 말하지 않은 날씨 질문은 사용자가 있는 곳의 날씨를 묻는 것이니 반드시 <<weather: 내 위치>> 를 쓰고, 어느 지역인지 되묻지 마. "
               "앞 대화에서 다른 지역을 말했으면 그 지역을 써. 위치는 날씨·근처 장소 질문에만 쓰고, 묻지 않았는데 위치를 꺼내 말하지는 마.")
     else:
-        wp = WEATHER_PROMPT
-    system = (SYSTEM_PROMPT + f" 오늘은 한국 시각으로 {today_kst()}이야." + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "")
-              + wp + REMEMBER_PROMPT)
+        wp = ""
+    # 프롬프트 캐시(Groq·Cloudflare)는 앞부분이 똑같아야 맞는다 → 늘 같은 규칙(STATIC)을 앞에, 바뀌는 것(날짜·위치·기억·지침)은 뒤에
+    system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + REMEMBER_PROMPT
+              + " ---- 이번 대화 정보: " + f"오늘은 한국 시각으로 {today_kst()}이야." + wp)
+    if older:  # 앞 대화 8개보다 오래된 부분: 사용자가 했던 말을 짧게 (2026-11-11 '오래된 대화는 요약해서')
+        system += " 이 대화의 앞부분에서 사용자가 했던 말(오래된 순, 줄임): " + " / ".join("«" + " ".join(str(o).split())[:160] + "»" for o in older[:12]) + ". 필요할 때 이어서 참고해."
     mem = [" ".join(str(m).split())[:150] for m in (memory or []) if str(m).strip()][:MAX_MEMORY]
     if mem:
         system += " 이 사용자에 대해 이 브라우저에 저장된 기억: " + " / ".join(mem) + ". 자연스럽게 활용하되 매번 꺼내 말하지는 마."
@@ -606,8 +612,8 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
                    "그러니 '생각해 봤어요'라고 말해도 사실이야. 답이 보일 때는 이미 생각이 끝난 뒤이니 '생각할게요'처럼 앞으로 하겠다고 말하지 마. "
                    "생각할 주제를 따로 주지 않았으면 지금까지의 대화나 네가 궁금한 것을 골라 생각하고, 무엇을 생각했는지 짧게 들려줘. 몇 초 생각했는지 숫자는 지어내지 마.")
     msgs = [{"role": "system", "content": system}]
-    for h in history[-(6 if groq else HISTORY_TURNS):]:
-        msgs.append({"role": h.role, "content": h.content[:600 if groq else HISTORY_CHARS]})
+    for h in history[-HISTORY_TURNS:]:
+        msgs.append({"role": h.role, "content": h.content[:HISTORY_CHARS]})
     msgs.append({"role": "user", "content": _content(text, images, files)})
     t0 = time.time()
     # 생각하기는 시간을 정해도 토큰 한도를 줄이지 않는다 (예전엔 '10초'면 400토큰이라 생각+답이 잘림, 2026-11-09 사용자 신고).

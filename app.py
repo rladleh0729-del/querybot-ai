@@ -346,6 +346,7 @@ class ChatIn(BaseModel):
     location: LocIn | None = None
     style: str = Field(default="", max_length=20)          # 설정 > 사용자 지침 > 말투 (Gemma 4만)
     instructions: str = Field(default="", max_length=1500)  # 설정 > 사용자 지침 (Gemma 4만, 서버에 저장 안 함)
+    older: list[str] = Field(default_factory=list, max_length=12)  # 앞 대화 8개보다 오래된 사용자 말(줄임, 2026-11-11)
     rid: str = Field(default="", max_length=48)  # 이 질문의 번호 — 답을 만드는 중에 페이지를 닫아도 다시 열면 이어 받게 (2026-11-11)
 
 
@@ -585,7 +586,7 @@ def _chat_core(body: ChatIn, request: Request):
             if (body.model == GEMMA_KEY and not cf_chat.ready()) or (body.model == GROQ_KEY and not cf_chat.groq_ready()):
                 raise HTTPException(status_code=400, detail="없는 모델")
             args = dict(think=body.think, memory=body.memory, location=body.location.model_dump() if body.location else None,
-                        style=body.style, instructions=body.instructions)
+                        style=body.style, instructions=body.instructions, older=[str(o)[:200] for o in body.older])
             try:
                 if body.model == GROQ_KEY:
                     try:
