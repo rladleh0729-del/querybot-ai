@@ -372,6 +372,7 @@ async def health():
     if cf_chat.ready():
         out["quota"] = cf_chat.usage()  # Gemma 4 오늘 남은 뉴런 (무료 하루 10,000, 한국 오전 9시 초기화)
         out["gemma"] = cf_chat.status()  # Cloudflare 열쇠가 살아 있는지 {ok, reason} (2026-11-10)
+    out["gd_login"] = bool(GOOGLE_CLIENT_SECRET)  # Google Drive 로그인(오래 가는 연결) 준비됐는지 — 페이지가 연결 방식을 고름 (2026-11-11)
     return out
 
 
