@@ -127,8 +127,13 @@ gc.collect()
 log(f"기본 모델 준비: {loaded['latest'].info}")
 CHOICES = [("latest", "최신 모델", "")] + [m for m in EXTRA_MODELS if has_files(m[2])]
 GEMMA_KEY = "gemma4"
+GROQ_KEY = "gptoss"  # Groq gpt-oss-120b (2026-11-11), GROQ_API_KEY가 있을 때만
+SMART_KEYS = (GEMMA_KEY, GROQ_KEY)
 if cf_chat.ready():  # 파일 없이 Cloudflare가 답하는 모델 (앞머리 None)
     CHOICES.append((GEMMA_KEY, "Gemma 4 (구글 26B)", None))
+if cf_chat.groq_ready():
+    CHOICES.append((GROQ_KEY, "GPT-OSS 120B (빠름)", None))
+log(f"GPT-OSS 120B(Groq): {'켜짐' if cf_chat.groq_ready() else '열쇠 없음 → 목록에서 뺌'}")
 log(f"Gemma 4(Cloudflare): {'켜짐' if cf_chat.ready() else '열쇠 없음 → 목록에서 뺌'}")
 load_lock = threading.Lock()
 
@@ -543,14 +548,16 @@ def _chat_core(body: ChatIn, request: Request):
     # 글자 수 제한 없음 (2026-11-10). Gemma 4는 줄바꿈을 살려서(코드·긴 글), 기본 모델은 한 줄로 펴서 앞부분만
     raw = body.message.replace("\r\n", "\n").replace("\r", "\n")
     flat = " ".join(raw.split())
-    if body.model == GEMMA_KEY:
+    if body.model in SMART_KEYS:
         text = re.sub(r"\n{3,}", "\n\n", "\n".join(line.rstrip() for line in raw.strip().split("\n")))
     else:
         text = flat[:BASIC_INPUT_CHARS]
     attached = bool(body.images or body.files)
     if attached:
-        if body.model != GEMMA_KEY:
+        if body.model not in SMART_KEYS:
             raise HTTPException(status_code=400, detail="그림·파일 첨부는 Gemma 4에서만 할 수 있어요")
+        if body.model == GROQ_KEY and body.images:
+            raise HTTPException(status_code=400, detail="그림은 Gemma 4에서만 볼 수 있어요")
         for u in body.images:
             if len(u) > MAX_IMAGE_CHARS or not IMAGE_URL.match(u):
                 raise HTTPException(status_code=400, detail="그림 파일을 읽을 수 없어요 (jpg·png·webp·gif, 큰 그림은 줄여서)")
@@ -559,7 +566,7 @@ def _chat_core(body: ChatIn, request: Request):
     if not text:
         raise HTTPException(status_code=400, detail="빈 메시지")
     check_rate_limit(client_ip(request))
-    slot = gemma_in_flight if body.model == GEMMA_KEY else in_flight
+    slot = gemma_in_flight if body.model in SMART_KEYS else in_flight
     if not slot.acquire(blocking=False):
         # 503이 아니라 429: 페이지는 503을 '서버 꺼짐'으로 보여 준다.
         raise HTTPException(status_code=429, detail="잠시 후 다시 시도")
@@ -568,20 +575,32 @@ def _chat_core(body: ChatIn, request: Request):
         # 기본 모델로 대화할 때만: 주인이 가르친 말이면 그 답을 바로 (다른 모델을 고른 방문자에겐 그 모델 답 그대로)
         answer = taught.get(teach_norm(text)) if body.model == "latest" else None
         # 지식 질문 → 위키백과 요약(+출처). Gemma 4는 위키 첫 문장보다 스스로 더 잘 답해서 건너뜀(2026-11-08 사용자: "위키 때문에 멍청해 보인다")
-        wiki = None if answer or body.model == GEMMA_KEY or len(text) > MAX_INPUT_CHARS else wiki_search.lookup(text)
+        wiki = None if answer or body.model in SMART_KEYS or len(text) > MAX_INPUT_CHARS else wiki_search.lookup(text)
         extra = None  # Gemma 4 웹 검색 출처 {"sources": [...], "searched": 검색어}
         if answer:
             reply, kept = answer, 0
         elif wiki:
             reply, kept = wiki["reply"], 0
-        elif body.model == GEMMA_KEY:
-            if not cf_chat.ready():
+        elif body.model in SMART_KEYS:
+            if (body.model == GEMMA_KEY and not cf_chat.ready()) or (body.model == GROQ_KEY and not cf_chat.groq_ready()):
                 raise HTTPException(status_code=400, detail="없는 모델")
+            args = dict(think=body.think, memory=body.memory, location=body.location.model_dump() if body.location else None,
+                        style=body.style, instructions=body.instructions)
             try:
-                # 그림·파일 첨부와 웹 검색은 Gemma 4만 (2026-11-09 사용자 요청)
-                reply, extra = cf_chat.reply(text, body.history, body.images, body.files, think=body.think, memory=body.memory,
-                                             location=body.location.model_dump() if body.location else None,
-                                             style=body.style, instructions=body.instructions)
+                if body.model == GROQ_KEY:
+                    try:
+                        reply, extra = cf_chat.reply(text, body.history, body.images, body.files, provider="groq", **args)
+                    except cf_chat.Busy as ge:
+                        # Groq 무료 한도(분당·하루 토큰)에 걸리거나 안 되면 Gemma 4가 대신 (그것도 안 되면 아래에서 기본 모델)
+                        if not cf_chat.ready():
+                            raise
+                        reply, extra = cf_chat.reply(text, body.history, body.images, body.files, **args)
+                        why_g = "GPT-OSS 무료 사용량이 잠시 꽉 차서" if isinstance(ge, cf_chat.QuotaError) else "GPT-OSS가 잠시 응답하지 않아서"
+                        reply = f"({why_g} Gemma 4가 대신 답해요.)\n\n{reply}"
+                        extra = dict(extra or {}, fallback="groq→gemma")
+                else:
+                    # 그림·파일 첨부와 웹 검색은 Gemma 4만 (2026-11-09 사용자 요청)
+                    reply, extra = cf_chat.reply(text, body.history, body.images, body.files, **args)
             except cf_chat.TooLong:
                 raise HTTPException(status_code=400, detail="글이 너무 길어서 Gemma 4가 한 번에 다 읽을 수 없어요. 몇 번에 나눠서 보내 주세요.")
             except cf_chat.Busy as e:

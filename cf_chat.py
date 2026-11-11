@@ -7,6 +7,7 @@
   (위키 없이 물으면 8B·Qwen 모두 숫자·이름을 지어냄 — 2026-11-08 시험)
 - PC판 원본: C:\\python venv\\qwen8b_local\\qwen_server.py (같은 규칙)
 """
+import contextvars
 import datetime
 import json
 import os
@@ -288,6 +289,56 @@ def ready() -> bool:
     return bool(CF_ACCOUNT_ID and CF_API_TOKEN)
 
 
+# ---------------------------------------------------------
+# Groq — gpt-oss-120b (2026-11-11 사용자: "Groq Developer API 진짜 좋아 보이는데" → 키 만듦)
+# 아주 빠름(초당 수백 토큰). 무료는 분당 8천·하루 20만 토큰이라 질문 하나(3~6천 토큰)면 하루 40~60번 → 한도에 걸리면 app.py가 Gemma 4로 넘김.
+# 같은 reply()를 쓰고, 이 요청이 어느 쪽인지는 _provider로 구분 (그림은 못 봄 — 글·파일만)
+# ---------------------------------------------------------
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b").strip()
+_provider = contextvars.ContextVar("qb_provider", default="cf")
+
+
+def groq_ready() -> bool:
+    return bool(GROQ_API_KEY)
+
+
+def _call_groq(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
+    body = {"model": GROQ_MODEL, "messages": messages, "temperature": TEMPERATURE,
+            "max_completion_tokens": max_tokens or (THINK_MAX_TOKENS if think else MAX_TOKENS),
+            "reasoning_effort": "medium" if think else "low", "include_reasoning": bool(think)}
+    data = json.dumps(body).encode("utf-8")
+    for attempt in range(2):
+        req = urllib.request.Request("https://api.groq.com/openai/v1/chat/completions", data=data,
+                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + GROQ_API_KEY,
+                                              "User-Agent": "querybot-ai/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            for c in d.get("choices") or []:  # 생각 글은 'reasoning'으로 옴 → 아래 코드가 읽는 이름으로
+                m = c.get("message") or {}
+                if m.get("reasoning") and not m.get("reasoning_content"):
+                    m["reasoning_content"] = m.pop("reasoning")
+            return d
+        except urllib.error.HTTPError as e:
+            msg = e.read().decode("utf-8", "replace")[:300]
+            log(f"Groq 오류 {e.code}: {msg[:160]}")
+            if e.code in (401, 403):
+                raise AuthError() from e
+            if e.code == 429:
+                raise QuotaError() from e
+            if e.code in (400, 413) and re.search(r"context|too long|too large|maximum|tokens", msg, re.I):
+                raise TooLong() from e
+            if e.code >= 500 and attempt < 1:
+                time.sleep(1.2)
+                continue
+            raise Busy() from e
+        except Exception as e:  # noqa: BLE001
+            log(f"Groq 연결 실패: {type(e).__name__}")
+            raise Busy() from e
+    raise Busy()
+
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] [gemma] {msg}", flush=True)
 
@@ -323,6 +374,8 @@ def wiki_context(text: str):
 
 
 def _call(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
+    if _provider.get() == "groq":
+        return _call_groq(messages, think, max_tokens)
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
     body = json.dumps({"model": CF_MODEL, "messages": messages, "temperature": TEMPERATURE,
                        "max_tokens": max_tokens or (THINK_MAX_TOKENS if think else MAX_TOKENS),
@@ -479,7 +532,17 @@ MAX_INSTR = 1500
 
 
 def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
-          style: str = "", instructions: str = ""):
+          style: str = "", instructions: str = "", provider: str = "cf"):
+    """provider = "cf"(Gemma 4, Cloudflare) 또는 "groq"(gpt-oss-120b). 나머지는 _reply 설명 그대로."""
+    tok = _provider.set("groq" if provider == "groq" and groq_ready() else "cf")
+    try:
+        return _reply(text, history, images, files, think, memory, location, style, instructions)
+    finally:
+        _provider.reset(tok)
+
+
+def _reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
+           style: str = "", instructions: str = ""):
     """(답, 덧붙일 정보 또는 None). 덧붙일 정보 = {"sources": [{title, url}], "searched": 검색어,
     "thought": {"seconds", "summary", "asked"}, "remember": [새로 기억할 한 줄]}.
     history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}],
@@ -518,11 +581,15 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
     ins = " ".join(str(instructions or "").split())[:MAX_INSTR]
     if ins:  # 사용자가 설정에 직접 적은 지침 (안전·정직 규칙과 부딪히면 그 부분만 따르지 않음)
         system += (" 사용자가 설정의 '사용자 지침'에 직접 적어 둔 내용이야. 안전·정직 규칙과 부딪히지 않는 한 답할 때 꼭 따라: «" + ins + "»")
+    groq = _provider.get() == "groq"
+    if groq:
+        system = system.replace("Gemma나 구글이 만든 모델이라고 소개하지 말고, 무슨 모델·기술로 움직이는지 직접 물을 때만 구글 Gemma 4를 바탕으로 한다고 말해.",
+                                "다른 회사가 만든 모델이라고 소개하지 말고, 무슨 모델·기술로 움직이는지 직접 물을 때만 OpenAI의 공개 모델 gpt-oss-120b를 바탕으로 Groq에서 돌아간다고 말해.")
     system_plain = system  # 생각하기가 실패해 생각 없이 다시 부를 때 쓰는 지시문 ('생각했다'는 말이 없음)
     # 빠른 생각 (2026-11-11 사용자: "생각만 1분은 좀 길어. 고작 26b인데") — Gemma의 생각 기능은 짧게 하라고 해도 한도(2,400~4,000토큰)를 다 써서
     # Cloudflare 속도(초당 26~46토큰)로 50~120초가 걸림 → '생각' 단추는 답 앞에 3~8줄 풀이를 먼저 쓰게 하고(보통 +3~8초), 그 풀이를 '생각 요약'으로 보여 준다.
     # "생각해 봐", "30초 동안 생각해" 처럼 직접 부탁하면 예전처럼 진짜 생각 기능.
-    fast = think and not asked
+    fast = think and not asked and not groq  # Groq는 진짜 생각도 몇 초면 끝나서 그대로
     if fast:
         think = False
         system += (" 이번 답은 '생각' 단추를 켜고 만든 거야. 답을 쓰기 전에 맨 앞에 <<생각>> 한 줄을 쓰고, 그 아래에 이 질문을 어떻게 풀지 "
@@ -539,8 +606,8 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
                    "그러니 '생각해 봤어요'라고 말해도 사실이야. 답이 보일 때는 이미 생각이 끝난 뒤이니 '생각할게요'처럼 앞으로 하겠다고 말하지 마. "
                    "생각할 주제를 따로 주지 않았으면 지금까지의 대화나 네가 궁금한 것을 골라 생각하고, 무엇을 생각했는지 짧게 들려줘. 몇 초 생각했는지 숫자는 지어내지 마.")
     msgs = [{"role": "system", "content": system}]
-    for h in history[-HISTORY_TURNS:]:
-        msgs.append({"role": h.role, "content": h.content[:HISTORY_CHARS]})
+    for h in history[-(6 if groq else HISTORY_TURNS):]:
+        msgs.append({"role": h.role, "content": h.content[:600 if groq else HISTORY_CHARS]})
     msgs.append({"role": "user", "content": _content(text, images, files)})
     t0 = time.time()
     # 생각하기는 시간을 정해도 토큰 한도를 줄이지 않는다 (예전엔 '10초'면 400토큰이라 생각+답이 잘림, 2026-11-09 사용자 신고).
