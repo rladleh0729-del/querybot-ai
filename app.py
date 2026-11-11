@@ -638,7 +638,7 @@ def _chat_core(body: ChatIn, request: Request):
     if body.location:
         kind += " [위치]"  # 좌표·동네 이름은 남기지 않는다
     if extra and extra.get("fallback"):
-        kind += f" [Gemma 실패 → 기본 모델: {extra['fallback']}]"
+        kind += " [GPT-OSS 한도·오류 → Gemma 4가 대신]" if extra["fallback"] == "groq→gemma" else f" [Gemma 실패 → 기본 모델: {extra['fallback']}]"
     log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{kind} ({time.time() - t0:.1f}초)")
     out = {"reply": reply, "kept_turns": kept}
     if answer:

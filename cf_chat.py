@@ -100,6 +100,9 @@ SEARCH_PROMPT = (
     "그러면 검색 결과를 알려 줄 테니 그걸로 답해. 일상 대화·일반 상식·코딩·수학·첨부한 그림이나 파일 설명처럼 검색이 필요 없으면 바로 답해."
 )
 SEARCH_TAG = re.compile(r"<<\s*search\s*:\s*(.+?)\s*>>", re.S | re.I)
+THINK_OPEN = r"<<\s*[^<>/:\n]{1,8}\s*>>"
+THINK_CLOSE = r"<<\s*/\s*[^<>:\n]{0,8}\s*>>"
+THINK_BLOCK = re.compile(THINK_OPEN + r"\s*(.*?)\s*" + THINK_CLOSE, re.S)  # 2026-11-11: 모델이 <<생약>>처럼 틀리게 쓰기도 함
 ANY_TAG = re.compile(r"<<\s*(calc|search|remember|weather)\s*:.*?>>", re.S | re.I)
 # 날씨 도구 (2026-11-09): 웹 검색으로 날씨를 찾으면 맛집·PDF가 걸려서, 날씨는 weather.py(OpenStreetMap 지명 + Open-Meteo 예보)로
 WEATHER_PROMPT = (
@@ -635,11 +638,11 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     reasoning = (first.get("reasoning_content") or "").strip() if think else ""
     fast_note = ""
     if fast:  # 빠른 생각: <<생각>> … <</생각>> 를 떼어 생각 요약으로
-        m = re.match(r"\s*<<\s*생각\s*>>\s*(.*?)\s*<<\s*/\s*생각\s*>>\s*(.*)$", raw, re.S)
+        m = re.match(r"\s*" + THINK_OPEN + r"\s*(.*?)\s*" + THINK_CLOSE + r"\s*(.*)$", raw, re.S)
         if m:
             fast_note, raw = m.group(1).strip()[:1200], m.group(2)
-        elif re.match(r"\s*<<\s*생각\s*>>", raw):  # 닫는 표시가 없으면 첫 빈 줄까지를 생각으로
-            body = re.sub(r"^\s*<<\s*생각\s*>>\s*", "", raw)
+        elif re.match(r"\s*" + THINK_OPEN, raw):  # 닫는 표시가 없으면 첫 빈 줄까지를 생각으로
+            body = re.sub(r"^\s*" + THINK_OPEN + r"\s*", "", raw)
             parts = body.split("\n\n", 1)
             fast_note, raw = parts[0].strip()[:1200], (parts[1] if len(parts) > 1 else parts[0])
     if think and not reasoning:  # 생각 글이 본문에 <think>…</think>로 섞여 오는 경우
@@ -693,6 +696,11 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
             break
         d = _call(msgs)
         out = _finish(msgs, d, clean(d["choices"][0]["message"]["content"] or ""))
+    # 빠른 생각 표시(<<생각>>…<</생각>>)는 검색·계산 뒤 두 번째 답에도 붙을 수 있음 → 모든 단계에서 떼고, 첫 풀이가 없으면 여기서 챙김 (2026-11-11 화면에 글자 그대로 보임)
+    for mt in THINK_BLOCK.finditer(out):
+        if fast and not fast_note:
+            fast_note = mt.group(1).strip()[:1200]
+    out = THINK_BLOCK.sub("", out).strip()
     remember = [" ".join(m.split())[:150] for m in REMEMBER_TAG.findall(out)][:2]
     out = ANY_TAG.sub("", out).strip()  # 혹시 남은 도구 표시는 지움
     # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움) — 사용자가 그 글자(일본어·중국어·러시아어 등)로 쓴 경우는 그대로 둔다
