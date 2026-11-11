@@ -118,7 +118,8 @@ THINK_ASK = re.compile(r"(생각|고민|궁리|숙고|추론)\s*(을|를|좀|해
 THINK_OPINION = re.compile(r"(어떻게|뭐라고|무슨|어떤)\s*생각|(다고|라고|냐고|하다고|같다고)\s*생각|생각(해|하니|해요|하세요|하냐|하나요|하시나요)\s*[?？]?\s*$|what do you think|do you think|you think\s*\?", re.I)
 THINK_TIME = re.compile(r"(\d{1,3})\s*(초|분|seconds?|secs?|minutes?|mins?)", re.I)
 MAX_THINK_WAIT = 60      # 사용자가 정한 생각 시간은 60초까지만 (페이지는 90초 기다림)
-THINK_MAX_TOKENS = 4000  # 생각(보통 1,000~1,500토큰) + 답. 모자라면 생각만 하고 답이 비거나 답이 중간에 끊김(2026-11-08, 11-09)
+THINK_MAX_TOKENS = 2400  # (2026-11-11) 4,000이면 어림 문제에서 생각만 94초 하고 답이 빔 → 짧게 생각하라는 지시 + 한도 2,400(약 50초가 최대)
+_THINK_MAX_OLD = 4000  # 생각(보통 1,000~1,500토큰) + 답. 모자라면 생각만 하고 답이 비거나 답이 중간에 끊김(2026-11-08, 11-09)
 # 기억 (2026-11-09): 사용자가 알려 준 이름·취향 같은 것은 모델이 <<remember: …>>로 내고, 페이지가 이 브라우저에 저장해 다음 대화부터 같이 보낸다
 REMEMBER_TAG = re.compile(r"<<\s*remember\s*:\s*(.+?)\s*>>", re.S | re.I)
 MAX_MEMORY = 12
@@ -127,6 +128,11 @@ REMEMBER_PROMPT = (
     "그러면 이 사용자의 브라우저에 저장돼 다음에도 알 수 있으니, 그때만 '기억할게요'라고 말해. 이미 저장된 기억과 같은 내용은 다시 <<remember>> 하지 마. "
     "비밀번호·주민번호·전화번호·주소·계좌 같은 민감한 정보는 저장하지 마."
 )
+
+
+# 인사·맞장구·짧은 잡담은 '생각' 단추가 켜져 있어도 생각을 건너뛴다 (2026-11-11 사용자: "안녕이라는 질문이라도 생각 모드를 키면 너무 오래 걸려")
+SMALL_TALK = re.compile(r"^\s*(안녕\S{0,4}|하이|헬로|ㅎㅇ|ㅎㅇㅎㅇ|반가워\S{0,3}|고마워\S{0,3}|감사\S{0,4}|땡큐|좋아\S{0,3}|굿|오케이|ㅇㅋ|ㅇㅇ|응|네|그래|알겠어\S{0,3}|잘\s?자|굿나잇|"
+                        r"hi|hello|hey|thanks?|thank you|ok(ay)?|good night|bye|ㅋ+|ㅎ+|ㅠ+|ㅜ+)[\s!.~?♡♥ㅎㅋㅠㅜ^]*$", re.I)
 
 
 def think_request(text: str):
@@ -483,6 +489,8 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
         text = text[:120000] + f"\n\n…(글이 너무 길어서 가운데 {cut:,}자는 빼고 보냄)…\n\n" + text[-80000:]
     asked, secs = think_request(text)
     think = bool(think or asked)
+    if think and not asked and SMALL_TALK.match(text or ""):  # 단추만 켜져 있고 인사·맞장구면 생각 없이 바로
+        think = False
     # 위치 공유 (2026-11-09): 페이지의 '위치' 단추를 켜면 대략 좌표(소수 둘째 자리 ≈ 1km)가 온다 → 동네 이름으로 바꿔 알려 준다(로그에는 안 남김)
     loc = None
     if location:
@@ -511,9 +519,23 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
     if ins:  # 사용자가 설정에 직접 적은 지침 (안전·정직 규칙과 부딪히면 그 부분만 따르지 않음)
         system += (" 사용자가 설정의 '사용자 지침'에 직접 적어 둔 내용이야. 안전·정직 규칙과 부딪히지 않는 한 답할 때 꼭 따라: «" + ins + "»")
     system_plain = system  # 생각하기가 실패해 생각 없이 다시 부를 때 쓰는 지시문 ('생각했다'는 말이 없음)
+    # 빠른 생각 (2026-11-11 사용자: "생각만 1분은 좀 길어. 고작 26b인데") — Gemma의 생각 기능은 짧게 하라고 해도 한도(2,400~4,000토큰)를 다 써서
+    # Cloudflare 속도(초당 26~46토큰)로 50~120초가 걸림 → '생각' 단추는 답 앞에 3~8줄 풀이를 먼저 쓰게 하고(보통 +3~8초), 그 풀이를 '생각 요약'으로 보여 준다.
+    # "생각해 봐", "30초 동안 생각해" 처럼 직접 부탁하면 예전처럼 진짜 생각 기능.
+    fast = think and not asked
+    if fast:
+        think = False
+        system += (" 이번 답은 '생각' 단추를 켜고 만든 거야. 답을 쓰기 전에 맨 앞에 <<생각>> 한 줄을 쓰고, 그 아래에 이 질문을 어떻게 풀지 "
+                   "3~8줄로 짧게 따져 봐(핵심 가정·계산·확인을 한 줄에 한 단계씩, 사용자가 쓴 언어로, 모두 합쳐 500자 안쪽). "
+                   "그다음 <</생각>> 한 줄을 쓰고 이어서 사용자에게 보일 답을 써. 답에서는 생각 부분을 되풀이하지 말고 결론과 설명을 써. "
+                   "도구(<<calc>>·<<search>>·<<weather>>)가 필요하면 <</생각>> 다음에 써. 몇 초 생각했는지 숫자는 지어내지 마.")
     if think:
         system += (" 이번 답은 실제로 '생각하기' 기능을 켜고 만들어" + (f"지고, 사용자에게는 실제로 {secs}초 넘게 지난 뒤에 보여져" if secs else "져") +
-                   ". 답하거나 도구(<<calc>>·<<search>>)를 쓰기 전에 반드시 속으로 충분히 따져 보는 생각 과정을 먼저 거쳐. "
+                   ". 답하거나 도구(<<calc>>·<<search>>)를 쓰기 전에 반드시 속으로 따져 보는 생각 과정을 먼저 거쳐. "
+                   # 생각을 짧고 효율적으로 (2026-11-11: 어림 문제에서 생각 글 12,000자·94초)
+                   "생각은 효율적으로 해: 꼭 필요한 단계만 차례로 따지고, 같은 계산·확인·다시 쓰기를 되풀이하지 마. "
+                   "어림(페르미 추정) 문제는 핵심 가정 3~4개를 정해 곱하고 범위를 정한 뒤 바로 끝내. 쉬운 질문은 몇 줄만 생각해. "
+                   "생각은 길어야 200단어 안팎으로 끝내고 곧바로 답을 써. "
                    "그러니 '생각해 봤어요'라고 말해도 사실이야. 답이 보일 때는 이미 생각이 끝난 뒤이니 '생각할게요'처럼 앞으로 하겠다고 말하지 마. "
                    "생각할 주제를 따로 주지 않았으면 지금까지의 대화나 네가 궁금한 것을 골라 생각하고, 무엇을 생각했는지 짧게 들려줘. 몇 초 생각했는지 숫자는 지어내지 마.")
     msgs = [{"role": "system", "content": system}]
@@ -536,6 +558,15 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
     first = d1["choices"][0]["message"]
     raw = first.get("content") or ""
     reasoning = (first.get("reasoning_content") or "").strip() if think else ""
+    fast_note = ""
+    if fast:  # 빠른 생각: <<생각>> … <</생각>> 를 떼어 생각 요약으로
+        m = re.match(r"\s*<<\s*생각\s*>>\s*(.*?)\s*<<\s*/\s*생각\s*>>\s*(.*)$", raw, re.S)
+        if m:
+            fast_note, raw = m.group(1).strip()[:1200], m.group(2)
+        elif re.match(r"\s*<<\s*생각\s*>>", raw):  # 닫는 표시가 없으면 첫 빈 줄까지를 생각으로
+            body = re.sub(r"^\s*<<\s*생각\s*>>\s*", "", raw)
+            parts = body.split("\n\n", 1)
+            fast_note, raw = parts[0].strip()[:1200], (parts[1] if len(parts) > 1 else parts[0])
     if think and not reasoning:  # 생각 글이 본문에 <think>…</think>로 섞여 오는 경우
         m = re.search(r"<think>(.*?)(?:</think>|$)", raw, re.S)
         reasoning = m.group(1).strip() if m else ""
@@ -594,6 +625,9 @@ def reply(text: str, history: list, images=None, files=None, think: bool = False
         out = STRAY.sub("", ANY_TAG.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or ""))).strip()
     if remember:
         extra["remember"] = remember
+    if fast:  # 빠른 생각: 풀이를 그대로 요약으로 (요약을 만드는 호출 한 번을 아낌)
+        extra["thought"] = {"seconds": max(1, round(time.time() - t0)), "summary": clean(fast_note)[:800] if fast_note else "", "asked": 0}
+        log(f"빠른 생각: {round(time.time() - t0)}초 (풀이 {len(fast_note)}자)")
     if think:
         if summary is None:
             summary = _think_summary(reasoning, text) if reasoning else ""
