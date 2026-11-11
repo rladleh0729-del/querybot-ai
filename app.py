@@ -19,6 +19,8 @@ import os
 import re
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import defaultdict, deque
 from pathlib import Path
@@ -392,6 +394,78 @@ def taught_refresh(request: Request):
 class TitleIn(BaseModel):
     message: str = Field(max_length=1500)
     reply: str = Field(default="", max_length=1500)
+
+
+# ---------------------------------------------------------
+# Google Drive 저장소 연결 = 이 사이트의 '로그인' (2026-11-11 사용자: "다른 AI 사이트의 로그인 기능을 우리는 드라이브 연결로 대신")
+# 브라우저만으로 받는 권한은 1시간이면 끝나서 매번 다시 눌러야 함 → 처음 한 번 받은 인증 코드를 여기서 바꿔 '새로 고침 토큰'을 브라우저에 돌려주고,
+# 사이트를 열 때마다 그 토큰으로 조용히 새 권한을 받아 준다. 토큰·파일 내용은 서버에 저장하지 않고 로그에도 남기지 않는다.
+# 범위는 drive.file(QueryBot이 만든 백업 파일만). 클라이언트 보안 비밀은 Render 환경변수 GOOGLE_CLIENT_SECRET (없으면 503 → 페이지는 예전 방식)
+# ---------------------------------------------------------
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "546754663182-iss9ia4lnqgiqsg6jumb3gj71p1gsq4o.apps.googleusercontent.com")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+
+
+class GdCodeIn(BaseModel):
+    code: str = Field(min_length=10, max_length=1000)
+
+
+class GdRtIn(BaseModel):
+    rt: str = Field(min_length=10, max_length=1000)
+
+
+def _google_token(params: dict) -> dict:
+    data = urllib.parse.urlencode(dict(params, client_id=GOOGLE_CLIENT_ID, client_secret=GOOGLE_CLIENT_SECRET)).encode()
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            d = json.loads(e.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            d = {}
+        return {"error": str(d.get("error") or f"http {e.code}")[:40]}
+    except Exception as e:  # noqa: BLE001
+        return {"error": type(e).__name__}
+
+
+@app.post("/gd/login")
+def gd_login(body: GdCodeIn, request: Request):
+    check_rate_limit(client_ip(request))
+    if not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="Google Drive 로그인 준비 중")
+    d = _google_token({"code": body.code, "grant_type": "authorization_code", "redirect_uri": "postmessage"})
+    if "access_token" not in d:
+        log(f"[Drive] 연결 실패: {d.get('error')}")
+        raise HTTPException(status_code=400, detail="Google 연결에 실패했어요. 다시 눌러 주세요.")
+    log(f"[Drive] 연결 (새로 고침 토큰 {'있음' if d.get('refresh_token') else '없음'})")
+    return {"access_token": d["access_token"], "expires_in": int(d.get("expires_in") or 3600), "rt": d.get("refresh_token") or ""}
+
+
+@app.post("/gd/token")
+def gd_token(body: GdRtIn, request: Request):
+    check_rate_limit(client_ip(request))
+    if not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="Google Drive 로그인 준비 중")
+    d = _google_token({"refresh_token": body.rt, "grant_type": "refresh_token"})
+    if "access_token" not in d:
+        if d.get("error") in ("invalid_grant", "unauthorized_client"):
+            raise HTTPException(status_code=401, detail="Google Drive 연결이 끝났어요. 다시 연결해 주세요.")
+        raise HTTPException(status_code=502, detail="Google에 잠시 연결할 수 없어요.")
+    return {"access_token": d["access_token"], "expires_in": int(d.get("expires_in") or 3600)}
+
+
+@app.post("/gd/logout")
+def gd_logout(body: GdRtIn, request: Request):
+    check_rate_limit(client_ip(request))
+    try:  # Google 쪽 권한도 거둔다 (실패해도 페이지는 연결을 끊음)
+        urllib.request.urlopen(urllib.request.Request("https://oauth2.googleapis.com/revoke", data=urllib.parse.urlencode({"token": body.rt}).encode(),
+                                                      headers={"Content-Type": "application/x-www-form-urlencoded"}), timeout=10).close()
+    except Exception:  # noqa: BLE001
+        pass
+    log("[Drive] 연결 끊기")
+    return {"ok": True}
 
 
 @app.post("/title")
