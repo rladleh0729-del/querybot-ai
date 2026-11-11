@@ -341,6 +341,7 @@ class ChatIn(BaseModel):
     location: LocIn | None = None
     style: str = Field(default="", max_length=20)          # 설정 > 사용자 지침 > 말투 (Gemma 4만)
     instructions: str = Field(default="", max_length=1500)  # 설정 > 사용자 지침 (Gemma 4만, 서버에 저장 안 함)
+    rid: str = Field(default="", max_length=48)  # 이 질문의 번호 — 답을 만드는 중에 페이지를 닫아도 다시 열면 이어 받게 (2026-11-11)
 
 
 IMAGE_URL = re.compile(r"^data:image/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$")
@@ -483,8 +484,62 @@ def make_title(body: TitleIn, request: Request):
     return {"title": title}
 
 
+# ---------------------------------------------------------
+# 답 맡아 두기 (2026-11-11 사용자: "만들어지고 있는 대화에서 새로고침하거나 창 닫으면 사라져")
+# 페이지가 보낸 rid로, 답을 다 만들면 서버 메모리에 15분 동안만 둔다(디스크·로그에 안 남김). 다시 연 페이지가 /chat/result/{rid}로 찾아감
+# ---------------------------------------------------------
+RID_RE = re.compile(r"[A-Za-z0-9_-]{16,48}")
+RESULT_TTL = 900
+results: dict = {}  # rid → (시각, "running" 또는 답 dict)
+results_lock = threading.Lock()
+
+
+def _result_put(rid: str, val) -> None:
+    now = time.time()
+    with results_lock:
+        for k in [k for k, (t0, _) in results.items() if now - t0 > RESULT_TTL]:
+            del results[k]
+        if len(results) > 300:  # 넘치면 오래된 것부터
+            for k in sorted(results, key=lambda k: results[k][0])[:100]:
+                del results[k]
+        results[rid] = (now, val)
+
+
+@app.get("/chat/result/{rid}")
+def chat_result(rid: str):
+    # 조회만 하는 가벼운 요청이라 횟수 제한(1분 20번)에 넣지 않는다 — 3초마다 물어봐도 대화가 막히지 않게
+    if not RID_RE.fullmatch(rid):
+        raise HTTPException(status_code=404, detail="없음")
+    with results_lock:
+        hit = results.get(rid)
+    if not hit or time.time() - hit[0] > RESULT_TTL:
+        raise HTTPException(status_code=404, detail="없음")
+    if hit[1] == "running":
+        return JSONResponse({"status": "running"}, status_code=202)
+    return {"status": "done", "result": hit[1]}
+
+
 @app.post("/chat")
 def chat(body: ChatIn, request: Request):
+    rid = body.rid if body.rid and RID_RE.fullmatch(body.rid) else ""
+    if rid:
+        _result_put(rid, "running")
+    try:
+        out = _chat_core(body, request)
+    except HTTPException as e:
+        if rid:
+            _result_put(rid, {"error": e.status_code, "detail": e.detail if isinstance(e.detail, str) else ""})
+        raise
+    except Exception:
+        if rid:
+            _result_put(rid, {"error": 500, "detail": ""})
+        raise
+    if rid:
+        _result_put(rid, out)
+    return out
+
+
+def _chat_core(body: ChatIn, request: Request):
     # 글자 수 제한 없음 (2026-11-10). Gemma 4는 줄바꿈을 살려서(코드·긴 글), 기본 모델은 한 줄로 펴서 앞부분만
     raw = body.message.replace("\r\n", "\n").replace("\r", "\n")
     flat = " ".join(raw.split())
