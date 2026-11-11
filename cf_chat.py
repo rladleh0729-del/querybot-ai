@@ -457,7 +457,7 @@ def _search_note(q: str, found: list, start: int) -> str:
 def _think_summary(reasoning: str, text: str = "") -> str:
     """영어로 나오는 생각 글을 2~4문장으로 (페이지의 '생각 펼쳐 보기'용). 한국어로 물었으면 한국어, 아니면 사용자가 쓴 언어로. 실패하면 빈 글."""
     if not text or HANGUL.search(text):
-        lang_sys, lang_how = "너는 요약을 돕는 도우미야. 한국어 해요체로만 써.", "한국어 해요체 2~4문장으로"
+        lang_sys, lang_how = "너는 요약을 돕는 도우미야. 한국어로 써.", "한국어 2~4문장으로"  # 말투 강제 안 함 (2026-11-11)
     else:
         lang_sys = "You summarize. Write only in the same language as this user message: «" + text[:120] + "»."
         lang_how = "사용자 말과 같은 언어(«" + text[:60] + "»의 언어)로 2~4문장으로"
@@ -591,9 +591,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     if groq:
         system = system.replace("Gemma나 구글이 만든 모델이라고 소개하지 말고, 무슨 모델·기술로 움직이는지 직접 물을 때만 구글 Gemma 4를 바탕으로 한다고 말해.",
                                 "다른 회사가 만든 모델이라고 소개하지 말고, 무슨 모델·기술로 움직이는지 직접 물을 때만 OpenAI의 공개 모델 gpt-oss-120b를 바탕으로 Groq에서 돌아간다고 말해.")
-        # GPT-OSS는 한국어를 '~입니다'로 답하는 버릇이 있음 (2026-11-11 실서버) — 말투 설정이 있으면 뒤에 붙는 그 설정이 우선
-        if (style or "").strip() not in ("casual", "formal"):  # 반말·정중하게를 고른 사람은 그 말투 그대로
-            system += " 한국어로 답할 때는 '~해요', '~이에요' 같은 해요체로 써('~합니다', '~입니다'는 쓰지 마)."
+        # 말투는 강제하지 않는다 (2026-11-11 사용자: "해요체 절대 하지 마") — 설정의 말투를 고른 경우에만 그 말투
         system += " 수식은 $...$ 또는 $$...$$로 써."
     system_plain = system  # 생각하기가 실패해 생각 없이 다시 부를 때 쓰는 지시문 ('생각했다'는 말이 없음)
     # 빠른 생각 (2026-11-11 사용자: "생각만 1분은 좀 길어. 고작 26b인데") — Gemma의 생각 기능은 짧게 하라고 해도 한도(2,400~4,000토큰)를 다 써서
