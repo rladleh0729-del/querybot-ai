@@ -279,7 +279,7 @@ def groq_ready() -> bool:
 
 def _call_groq(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
     body = {"model": GROQ_MODEL, "messages": messages, "temperature": TEMPERATURE,
-            "max_completion_tokens": max_tokens or (THINK_MAX_TOKENS if think else MAX_TOKENS),
+            "max_completion_tokens": max_tokens or (THINK_MAX_TOKENS if think else 3000),  # GPT-OSS는 숨은 추론도 이 한도에 들어가고 빨라서 넉넉히 (2026-11-12)
             "reasoning_effort": "medium" if think else "low", "include_reasoning": bool(think)}
     data = json.dumps(body).encode("utf-8")
     for attempt in range(2):
@@ -615,7 +615,22 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
         elif re.match(r"\s*" + THINK_OPEN, raw):  # 닫는 표시가 없으면 첫 빈 줄까지를 생각으로
             body = re.sub(r"^\s*" + THINK_OPEN + r"\s*", "", raw)
             parts = body.split("\n\n", 1)
-            fast_note, raw = parts[0].strip()[:1200], (parts[1] if len(parts) > 1 else parts[0])
+            cut = (d1["choices"][0].get("finish_reason") or "") == "length"
+            if len(parts) > 1 and not cut:
+                fast_note, raw = parts[0].strip()[:1200], parts[1]
+            else:  # 생각만 쓰다가 끝남(닫는 표시도 답도 없음)
+                fast_note, raw = body.strip(), ""
+        if not raw.strip() and fast_note:
+            # 생각만 있고 답이 비었으면(어려운 문제에서 GPT-OSS가 그럼 — 2026-11-12 화면에 '...'), 따져 본 것을 바탕으로 최종 답만 한 번 더
+            # (생각 표시 지시가 없는 system_plain으로 — 또 생각만 쓰지 않게)
+            log(f"빠른 생각: 답이 비어 다시 ({len(fast_note)}자 생각)")
+            msgs = [{"role": "system", "content": system_plain}] + msgs[1:] + [
+                {"role": "assistant", "content": "(속으로 따져 본 것)\n" + fast_note[:4000]},
+                {"role": "user", "content": "방금 따져 본 것을 바탕으로 원래 질문의 최종 답을 써. 생각 표시(<<…>>) 없이, 풀이의 핵심 단계와 답을 분명히 보여 줘."}]
+            d1 = _call(msgs)
+            raw = d1["choices"][0]["message"].get("content") or ""
+            raw = THINK_BLOCK.sub("", raw)
+        fast_note = fast_note[:1200]
     if think and not reasoning:  # 생각 글이 본문에 <think>…</think>로 섞여 오는 경우
         m = re.search(r"<think>(.*?)(?:</think>|$)", raw, re.S)
         reasoning = m.group(1).strip() if m else ""
