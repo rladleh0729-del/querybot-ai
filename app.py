@@ -130,7 +130,7 @@ GEMMA_KEY = "gemma4"
 GROQ_KEY = "gptoss"  # Groq gpt-oss-120b (2026-11-11), GROQ_API_KEY가 있을 때만
 SMART_KEYS = (GEMMA_KEY, GROQ_KEY)
 if cf_chat.ready():  # 파일 없이 Cloudflare가 답하는 모델 (앞머리 None)
-    CHOICES.append((GEMMA_KEY, "Gemma 4 (구글 26B)", None))
+    CHOICES.append((GEMMA_KEY, "Nova G", None))  # 보이는 이름 (2026-11-13, 바탕은 구글 Gemma 4 26B)
 if cf_chat.groq_ready():
     CHOICES.append((GROQ_KEY, "GPT-OSS 120B (빠름)", None))
 log(f"GPT-OSS 120B(Groq): {'켜짐' if cf_chat.groq_ready() else '열쇠 없음 → 목록에서 뺌'}")
@@ -556,9 +556,9 @@ def _chat_core(body: ChatIn, request: Request):
     attached = bool(body.images or body.files)
     if attached:
         if body.model not in SMART_KEYS:
-            raise HTTPException(status_code=400, detail="그림·파일 첨부는 Gemma 4에서만 할 수 있어요")
+            raise HTTPException(status_code=400, detail="그림·파일 첨부는 Nova G·GPT-OSS에서만 할 수 있어요")
         if body.model == GROQ_KEY and body.images:
-            raise HTTPException(status_code=400, detail="그림은 Gemma 4에서만 볼 수 있어요")
+            raise HTTPException(status_code=400, detail="그림은 Nova G에서만 볼 수 있어요")
         for u in body.images:
             if len(u) > MAX_IMAGE_CHARS or not IMAGE_URL.match(u):
                 raise HTTPException(status_code=400, detail="그림 파일을 읽을 수 없어요 (jpg·png·webp·gif, 큰 그림은 줄여서)")
@@ -597,23 +597,23 @@ def _chat_core(body: ChatIn, request: Request):
                             raise
                         reply, extra = cf_chat.reply(text, body.history, body.images, body.files, **args)
                         why_g = "GPT-OSS 무료 사용량이 잠시 꽉 차서" if isinstance(ge, cf_chat.QuotaError) else "GPT-OSS가 잠시 응답하지 않아서"
-                        reply = f"({why_g} Gemma 4가 대신 답해요.)\n\n{reply}"
+                        reply = f"({why_g} Nova G가 대신 답해요.)\n\n{reply}"
                         extra = dict(extra or {}, fallback="groq→gemma")
                 else:
                     # 그림·파일 첨부와 웹 검색은 Gemma 4만 (2026-11-09 사용자 요청)
                     reply, extra = cf_chat.reply(text, body.history, body.images, body.files, **args)
             except cf_chat.TooLong:
-                raise HTTPException(status_code=400, detail="글이 너무 길어서 Gemma 4가 한 번에 다 읽을 수 없어요. 몇 번에 나눠서 보내 주세요.")
+                raise HTTPException(status_code=400, detail="글이 너무 길어서 Nova G가 한 번에 다 읽을 수 없어요. 몇 번에 나눠서 보내 주세요.")
             except cf_chat.Busy as e:
                 # Gemma 4가 안 되면 (열쇠 막힘·오늘 사용량 끝·Cloudflare 오류) 글 질문은 기본 모델이 대신 답한다 — 사이트가 '바빠요'로 멈추지 않게
                 # (2026-11-10 사용자: "최우선으로 고쳐. 항상 서버 깨우면 나오게" — Cloudflare 열쇠가 다시 만들어져 하루 동안 '바빠요'만 나옴)
                 q = cf_chat.usage()
                 if isinstance(e, cf_chat.AuthError):
-                    why = "Gemma 4 연결 열쇠에 문제가 있어서"
+                    why = "Nova G 연결 열쇠에 문제가 있어서"
                 elif isinstance(e, cf_chat.QuotaError) or q["left"] <= 0:
-                    why = "오늘 Gemma 4 무료 사용량을 다 써서(한국 시각 오전 9시에 다시 채워져요)"
+                    why = "오늘 Nova G 무료 사용량을 다 써서(한국 시각 오전 9시에 다시 채워져요)"
                 else:
-                    why = "Gemma 4가 잠시 응답하지 않아서"
+                    why = "Nova G가 잠시 응답하지 않아서"
                 if attached:  # 그림·파일은 기본 모델이 못 본다 → 503이면 페이지가 '꺼짐'으로 보여 주므로 429로
                     raise HTTPException(status_code=429, detail=f"{why} 지금은 그림·파일을 볼 수 없어요. 조금 뒤에 다시 시도해 주세요.")
                 reply, kept = make_reply(get_model("latest"), body.history, flat[:BASIC_INPUT_CHARS])
@@ -638,7 +638,7 @@ def _chat_core(body: ChatIn, request: Request):
     if body.location:
         kind += " [위치]"  # 좌표·동네 이름은 남기지 않는다
     if extra and extra.get("fallback"):
-        kind += " [GPT-OSS 한도·오류 → Gemma 4가 대신]" if extra["fallback"] == "groq→gemma" else f" [Gemma 실패 → 기본 모델: {extra['fallback']}]"
+        kind += " [GPT-OSS 한도·오류 → Nova G가 대신]" if extra["fallback"] == "groq→gemma" else f" [Gemma 실패 → 기본 모델: {extra['fallback']}]"
     log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{kind} ({time.time() - t0:.1f}초)")
     out = {"reply": reply, "kept_turns": kept}
     if answer:
