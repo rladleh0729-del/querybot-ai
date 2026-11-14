@@ -335,6 +335,7 @@ class FileIn(BaseModel):
 class LocIn(BaseModel):
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
+    prec: str | None = Field(default=None, max_length=10)  # 'exact' = 사용자가 정확한 위치를 고름(2026-11-14), 없으면 대략(약 1km)
 
 
 class ChatIn(BaseModel):

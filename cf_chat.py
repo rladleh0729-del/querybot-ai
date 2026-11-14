@@ -599,12 +599,14 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     if location:
         try:
             la, lo = float(_field(location, "lat")), float(_field(location, "lon"))
+            exact = _field(location, "prec") == "exact"  # 사용자가 '정확한 위치'를 고름(2026-11-14) → 소수 넷째 자리(약 10m), 아니면 둘째 자리(약 1km)
+            nd = 4 if exact else 2
             if -90 <= la <= 90 and -180 <= lo <= 180:
-                loc = (round(la, 2), round(lo, 2), weather.reverse(la, lo))
+                loc = (round(la, nd), round(lo, nd), weather.reverse(la, lo), exact)
         except (TypeError, ValueError):
             loc = None
     if loc:  # 위치를 알면 '지역 없는 날씨 질문 = 내 위치'로 (위치를 켰는데도 지역을 되묻던 일, 2026-11-09 PC 시험)
-        wp = (f" (위치) 사용자가 위치 공유를 켰어: 지금 대략 {loc[2] or '알 수 없는 동네'} 근처에 있어(위도 {loc[0]}, 경도 {loc[1]}). "
+        wp = (f" (위치) 사용자가 위치 공유를 켰어: 지금 {'' if loc[3] else '대략 '}{loc[2] or '알 수 없는 동네'} 근처에 있어(위도 {loc[0]}, 경도 {loc[1]}{', 정확한 위치' if loc[3] else ''}). "
               " 날씨·기온·비·눈·바람처럼 날씨를 물으면 웹 검색 말고 답 대신 한 줄로 <<weather: 지역 이름>> 만 써. "
               "지역을 말하지 않은 날씨 질문은 사용자가 있는 곳의 날씨를 묻는 것이니 반드시 <<weather: 내 위치>> 를 쓰고, 어느 지역인지 되묻지 마. "
               "앞 대화에서 다른 지역을 말했으면 그 지역을 써. 위치는 날씨·근처 장소 질문에만 쓰고, 묻지 않았는데 위치를 꺼내 말하지는 마.")
