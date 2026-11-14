@@ -83,7 +83,7 @@ ANY_TAG = re.compile(r"<<\s*(calc|search|remember|weather)\s*:.*?>>", re.S | re.
 # 날씨 도구 (2026-11-09): 웹 검색으로 날씨를 찾으면 맛집·PDF가 걸려서, 날씨는 weather.py(OpenStreetMap 지명 + Open-Meteo 예보)로
 WEATHER_PROMPT = (
     " 날씨는 검색 말고 <<weather: 지역>>(예: <<weather: 서울 서초구>>). 지역이 없으면: 위치를 알면 <<weather: 내 위치>>, 앞 대화에 지역이 있으면 그 지역, "
-    "둘 다 없으면 어느 지역인지 묻고 입력칸 '위치' 단추를 알려 줘(이미 한 번 물었으면 <<weather: 서울>>로 답하고 다른 지역은 말해 달라고 덧붙여)."
+    "둘 다 없어도 <<weather: 내 위치>>(이미 한 번 지역을 물었는데 또 지역 없이 물으면 <<weather: 서울>>로 답하고 다른 지역은 말해 달라고 덧붙여)."
 )
 WEATHER_TAG = re.compile(r"<<\s*weather\s*:\s*(.+?)\s*>>", re.S | re.I)
 MY_PLACE = re.compile(r"^(내\s*위치|현재\s*위치|지금\s*위치|여기|이\s*근처|내\s*근처|사용자\s*위치)$")
@@ -720,7 +720,10 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
             place = mw.group(1).strip()[:60]
             if MY_PLACE.match(place):
                 note, src = weather.report(lat=loc[0], lon=loc[1]) if loc else (
-                    "사용자의 위치를 몰라(위치 공유가 꺼져 있어). 어느 지역 날씨인지 물어보고, 입력칸의 '위치' 단추를 켜면 바로 알 수 있다고 알려 줘. 숫자는 지어내지 마.", None)
+                    "사용자의 위치를 몰라(위치 공유가 꺼져 있어). 어느 지역 날씨인지 한두 문장으로 짧게 물어봐. "
+                    "위치 공유 켜기 단추는 화면의 답 아래에 자동으로 붙으니 단추·메뉴·설정을 어떻게 누르라는 안내는 하지 마. 숫자는 지어내지 마.", None)
+                if not loc:
+                    extra["ask_location"] = True  # 페이지가 답 아래에 '위치 공유 켜기' 알약 단추를 붙임 (2026-11-14)
             else:
                 note, src = weather.report(place)
             if src:

@@ -732,6 +732,8 @@ def _chat_core(body: ChatIn, request: Request):
             out["remember"] = extra["remember"]  # 페이지가 이 브라우저에 저장할 새 기억
         if extra.get("fallback"):
             out["fallback"] = extra["fallback"]  # Gemma 4 대신 기본 모델이 답함 (AuthError·QuotaError·Busy)
+        if extra.get("ask_location"):
+            out["ask_location"] = True  # 위치를 몰라 지역을 물음 → 페이지가 답 아래에 '위치 공유 켜기' 단추 (2026-11-14)
     if body.model == GEMMA_KEY:
         out["quota"] = cf_chat.usage()  # 페이지가 '오늘 남은 사용량'을 바로 고침
     return out
