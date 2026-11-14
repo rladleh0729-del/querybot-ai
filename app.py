@@ -14,6 +14,7 @@ PyTorch 대신 numpy로 모델을 돌린다(np_model.py) — Render 무료 메�
 서버는 대화를 저장하지 않는다 — 페이지가 들고 있다가 매번 보낸다.
 """
 import gc
+import hashlib
 import json
 import os
 import re
@@ -128,13 +129,17 @@ log(f"기본 모델 준비: {loaded['latest'].info}")
 CHOICES = [("latest", "최신 모델", "")] + [m for m in EXTRA_MODELS if has_files(m[2])]
 GEMMA_KEY = "gemma4"
 GROQ_KEY = "gptoss"  # Groq gpt-oss-120b (2026-11-11), GROQ_API_KEY가 있을 때만
-SMART_KEYS = (GEMMA_KEY, GROQ_KEY)
+RUNPOD_KEY = "runpod"  # 주인 전용 Gemma 4 31B (RunPod, 2026-11-14) — 공개 목록에는 없음, 주인 확인 뒤 /owner 가 알려 줌
+RUNPOD_LABEL = "Gemma 4 31B (내 서버)"
+SMART_KEYS = (GEMMA_KEY, GROQ_KEY, RUNPOD_KEY)
+OWNER_EMAILS = {e.strip().lower() for e in os.environ.get("OWNER_EMAILS", "").split(",") if e.strip()}
 if cf_chat.ready():  # 파일 없이 Cloudflare가 답하는 모델 (앞머리 None)
     CHOICES.append((GEMMA_KEY, "Nova G", None))  # 보이는 이름 (2026-11-13, 바탕은 구글 Gemma 4 26B)
 if cf_chat.groq_ready():
     CHOICES.append((GROQ_KEY, "GPT-OSS 120B (빠름)", None))
 log(f"GPT-OSS 120B(Groq): {'켜짐' if cf_chat.groq_ready() else '열쇠 없음 → 목록에서 뺌'}")
 log(f"Gemma 4(Cloudflare): {'켜짐' if cf_chat.ready() else '열쇠 없음 → 목록에서 뺌'}")
+log(f"주인 전용 RunPod: {'켜짐' if cf_chat.runpod_ready() and OWNER_EMAILS else '꺼짐(RUNPOD_API_KEY·RUNPOD_ENDPOINT_ID·OWNER_EMAILS 필요)'}")
 load_lock = threading.Lock()
 
 
@@ -347,6 +352,7 @@ class ChatIn(BaseModel):
     style: str = Field(default="", max_length=20)          # 설정 > 사용자 지침 > 말투 (Gemma 4만)
     instructions: str = Field(default="", max_length=1500)  # 설정 > 사용자 지침 (Gemma 4만, 서버에 저장 안 함)
     older: list[str] = Field(default_factory=list, max_length=12)  # 앞 대화 8개보다 오래된 사용자 말(줄임, 2026-11-11)
+    gd: str = Field(default="", max_length=4096)  # 주인 전용 모델을 쓸 때만: Google Drive 로그인 권한(서버가 주인인지 확인, 저장 안 함)
     rid: str = Field(default="", max_length=48)  # 이 질문의 번호 — 답을 만드는 중에 페이지를 닫아도 다시 열면 이어 받게 (2026-11-11)
 
 
@@ -476,6 +482,62 @@ def gd_logout(body: GdRtIn, request: Request):
     return {"ok": True}
 
 
+# ---------------------------------------------------------
+# 주인 확인 (2026-11-14) — RunPod 모델은 주인 돈이 나가서 주인 계정(OWNER_EMAILS)으로 로그인했을 때만 보이고 쓸 수 있다.
+# 페이지가 Drive 로그인 권한을 보내면 Google Drive about(user.emailAddress)로 이메일을 확인. 토큰·이메일은 저장·로그 안 함(해시로 결과만 50분)
+# ---------------------------------------------------------
+_owner_cache: dict = {}
+_owner_lock = threading.Lock()
+
+
+def is_owner(token: str) -> bool:
+    if not token or not OWNER_EMAILS or not cf_chat.runpod_ready():
+        return False
+    h = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = time.time()
+    with _owner_lock:
+        hit = _owner_cache.get(h)
+    if hit and hit[0] > now:
+        return hit[1]
+    ok = False
+    try:
+        req = urllib.request.Request("https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)",
+                                     headers={"Authorization": "Bearer " + token})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            email = str((json.loads(r.read().decode("utf-8")).get("user") or {}).get("emailAddress") or "").lower()
+        ok = bool(email) and email in OWNER_EMAILS
+    except Exception as e:  # noqa: BLE001
+        log(f"[주인 확인] 실패: {type(e).__name__}")
+    with _owner_lock:
+        for k in [k for k, v in _owner_cache.items() if v[0] < now]:
+            del _owner_cache[k]
+        _owner_cache[h] = (now + (3000 if ok else 60), ok)
+    log(f"[주인 확인] {'주인' if ok else '주인 아님'}")
+    return ok
+
+
+class OwnerIn(BaseModel):
+    gd: str = Field(min_length=10, max_length=4096)
+
+
+@app.post("/owner")
+def owner_check(body: OwnerIn, request: Request):
+    check_rate_limit(client_ip(request))
+    if not is_owner(body.gd):
+        return {"owner": False, "models": []}
+    return {"owner": True, "models": [{"key": RUNPOD_KEY, "label": RUNPOD_LABEL}]}
+
+
+@app.post("/owner/warm")
+def owner_warm(body: OwnerIn, request: Request):
+    # 모델을 고르는 순간 서버를 미리 깨움 (질문을 쓰는 동안 1분 안팎의 깨어나는 시간을 넘김)
+    check_rate_limit(client_ip(request))
+    if not is_owner(body.gd):
+        raise HTTPException(status_code=403, detail="주인 계정으로 로그인했을 때만 쓸 수 있어요")
+    threading.Thread(target=cf_chat.runpod_warm, daemon=True).start()
+    return {"ok": True}
+
+
 @app.post("/title")
 def make_title(body: TitleIn, request: Request):
     # 대화 목록 제목: Gemma 4가 첫 말의 중심 내용을 짧게 (2026-11-10 사용자 요청). 안 되면 빈 제목 → 페이지는 첫 말 그대로
@@ -585,10 +647,23 @@ def _chat_core(body: ChatIn, request: Request):
         elif body.model in SMART_KEYS:
             if (body.model == GEMMA_KEY and not cf_chat.ready()) or (body.model == GROQ_KEY and not cf_chat.groq_ready()):
                 raise HTTPException(status_code=400, detail="없는 모델")
+            if body.model == RUNPOD_KEY and not is_owner(body.gd):
+                raise HTTPException(status_code=403, detail="이 모델은 주인 계정으로 로그인했을 때만 쓸 수 있어요")
             args = dict(think=body.think, memory=body.memory, location=body.location.model_dump() if body.location else None,
                         style=body.style, instructions=body.instructions, older=[str(o)[:200] for o in body.older])
             try:
-                if body.model == GROQ_KEY:
+                if body.model == RUNPOD_KEY:
+                    try:
+                        reply, extra = cf_chat.reply(text, body.history, body.images, body.files, provider="runpod", **args)
+                    except cf_chat.Busy as re_:
+                        # 내 서버가 안 되면(크레딧 끝·깨어나기 실패) Nova G가 대신
+                        if not cf_chat.ready():
+                            raise
+                        reply, extra = cf_chat.reply(text, body.history, body.images, body.files, **args)
+                        why_r = "내 서버 크레딧이 다 됐거나 바빠서" if isinstance(re_, cf_chat.QuotaError) else "내 서버가 제때 깨어나지 못해서"
+                        reply = f"({why_r} Nova G가 대신 답해요.)\n\n{reply}"
+                        extra = dict(extra or {}, fallback="runpod→gemma")
+                elif body.model == GROQ_KEY:
                     try:
                         reply, extra = cf_chat.reply(text, body.history, body.images, body.files, provider="groq", **args)
                     except cf_chat.Busy as ge:
@@ -638,7 +713,7 @@ def _chat_core(body: ChatIn, request: Request):
     if body.location:
         kind += " [위치]"  # 좌표·동네 이름은 남기지 않는다
     if extra and extra.get("fallback"):
-        kind += " [GPT-OSS 한도·오류 → Nova G가 대신]" if extra["fallback"] == "groq→gemma" else f" [Gemma 실패 → 기본 모델: {extra['fallback']}]"
+        kind += " [GPT-OSS 한도·오류 → Nova G가 대신]" if extra["fallback"] == "groq→gemma" else " [RunPod 실패 → Nova G가 대신]" if extra["fallback"] == "runpod→gemma" else f" [Gemma 실패 → 기본 모델: {extra['fallback']}]"
     log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{kind} ({time.time() - t0:.1f}초)")
     out = {"reply": reply, "kept_turns": kept}
     if answer:

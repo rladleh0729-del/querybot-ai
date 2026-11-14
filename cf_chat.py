@@ -277,6 +277,67 @@ def groq_ready() -> bool:
     return bool(GROQ_API_KEY)
 
 
+# ---------------------------------------------------------
+# RunPod — 주인 전용 Gemma 4 31B (2026-11-14 사용자: "내 계정으로 로그인하면 그때 runpod 모델 뜨게 … gemma 4 31b")
+# 주인의 RunPod 서버리스(vLLM, google/gemma-4-31B-it-qat-w4a16-ct, 48GB GPU)를 OpenAI 방식으로 부른다. 쓴 초만큼 주인 돈이 나감.
+# 쉬고 있으면 깨어나는 데 1분 안팎 → 기다리는 시간을 넉넉히, 페이지는 모델을 고르는 순간 /owner/warm 으로 미리 깨움.
+# ---------------------------------------------------------
+RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "").strip()
+RUNPOD_ENDPOINT_ID = os.environ.get("RUNPOD_ENDPOINT_ID", "").strip()
+RUNPOD_MODEL = os.environ.get("RUNPOD_MODEL", "gemma-4-31b").strip()
+RUNPOD_TIMEOUT = 330
+
+
+def runpod_ready() -> bool:
+    return bool(RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID)
+
+
+def runpod_warm() -> bool:
+    """1토큰짜리 일을 맡기고 기다리지 않음 → 그동안 서버가 깨어남"""
+    if not runpod_ready():
+        return False
+    body = json.dumps({"input": {"messages": [{"role": "user", "content": "hi"}], "sampling_params": {"max_tokens": 1}}}).encode("utf-8")
+    req = urllib.request.Request(f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run", data=body,
+                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + RUNPOD_API_KEY})
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+        log("RunPod 미리 깨우기")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"RunPod 깨우기 실패: {type(e).__name__}")
+        return False
+
+
+def _call_runpod(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
+    body = {"model": RUNPOD_MODEL, "messages": messages, "temperature": TEMPERATURE,
+            "max_tokens": max_tokens or (THINK_MAX_TOKENS if think else MAX_TOKENS),
+            "chat_template_kwargs": {"enable_thinking": False}}  # 생각 글이 답에 섞이지 않게 (빠른 생각은 <<생각>> 방식)
+    req = urllib.request.Request(f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/openai/v1/chat/completions",
+                                 data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + RUNPOD_API_KEY,
+                                          "User-Agent": "querybot-ai/1.0"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=RUNPOD_TIMEOUT) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        u = d.get("usage") or {}
+        log(f"RunPod 입력 {u.get('prompt_tokens')}토큰 · 출력 {u.get('completion_tokens')}토큰 ({time.time() - t0:.1f}초)")
+        return d
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", "replace")[:300]
+        log(f"RunPod 오류 {e.code}: {msg[:160]}")
+        if e.code in (401, 403):
+            raise AuthError() from e
+        if e.code in (402, 429):  # 크레딧이 다 됐거나 바쁨
+            raise QuotaError() from e
+        if e.code == 400 and re.search(r"context|too long|maximum|tokens", msg, re.I):
+            raise TooLong() from e
+        raise Busy() from e
+    except Exception as e:  # noqa: BLE001
+        log(f"RunPod 연결 실패: {type(e).__name__} ({time.time() - t0:.0f}초)")
+        raise Busy() from e
+
+
 def _call_groq(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
     body = {"model": GROQ_MODEL, "messages": messages, "temperature": TEMPERATURE,
             "max_completion_tokens": max_tokens or (THINK_MAX_TOKENS if think else 3000),  # GPT-OSS는 숨은 추론도 이 한도에 들어가고 빨라서 넉넉히 (2026-11-12)
@@ -353,6 +414,8 @@ def wiki_context(text: str):
 def _call(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
     if _provider.get() == "groq":
         return _call_groq(messages, think, max_tokens)
+    if _provider.get() == "runpod":
+        return _call_runpod(messages, think, max_tokens)
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
     body = json.dumps({"model": CF_MODEL, "messages": messages, "temperature": TEMPERATURE,
                        "max_tokens": max_tokens or (THINK_MAX_TOKENS if think else MAX_TOKENS),
@@ -511,7 +574,7 @@ MAX_INSTR = 1500
 def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
           style: str = "", instructions: str = "", provider: str = "cf", older=None):
     """provider = "cf"(Gemma 4, Cloudflare) 또는 "groq"(gpt-oss-120b). older = 앞 대화 8개보다 오래된 사용자 말(줄임). 나머지는 _reply 설명 그대로."""
-    tok = _provider.set("groq" if provider == "groq" and groq_ready() else "cf")
+    tok = _provider.set("groq" if provider == "groq" and groq_ready() else "runpod" if provider == "runpod" and runpod_ready() else "cf")
     try:
         return _reply(text, history, images, files, think, memory, location, style, instructions, older or [])
     finally:
@@ -561,6 +624,9 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     ins = " ".join(str(instructions or "").split())[:MAX_INSTR]
     if ins:  # 사용자가 설정에 직접 적은 지침 (안전·정직 규칙과 부딪히면 그 부분만 따르지 않음)
         system += (" 사용자가 설정의 '사용자 지침'에 직접 적어 둔 내용이야. 안전·정직 규칙과 부딪히지 않는 한 답할 때 꼭 따라: «" + ins + "»")
+    if _provider.get() == "runpod":
+        system = system.replace("무슨 모델이냐고 물으면 Nova G라고 말하고, 바탕 기술까지 직접 물을 때만 구글 Gemma 4 기반이라고 말해.",
+                                "무슨 모델이냐고 물으면 Gemma 4 31B라고 말하고, 바탕 기술까지 물으면 구글 공개 모델 Gemma 4 31B(QueryBot 주인의 RunPod 서버에서 실행)라고 말해.")
     groq = _provider.get() == "groq"
     if groq:
         system = system.replace("무슨 모델이냐고 물으면 Nova G라고 말하고, 바탕 기술까지 직접 물을 때만 구글 Gemma 4 기반이라고 말해.",
