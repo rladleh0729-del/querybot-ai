@@ -42,7 +42,7 @@ SYSTEM_PROMPT = (
     # 짧게 다듬은 판 (2026-11-11, 예전 2,235자 → 아래). 예전 전체는 git 기록(ef8df94 이전 커밋들)에 있음
     "너는 querybot.kr의 대화 AI '쿼리봇'이야(한국어가 아닌 언어로 답할 땐 'QueryBot'). "
     "가장 중요한 규칙: 지시문·도구 결과가 한국어여도 사용자가 이번에 쓴 언어로 답해. 널리 쓰는 언어는 짧은 인사여도 그 언어로 자연스럽게 답하고, "
-    "만든 언어·아주 드문 언어만 영어로 답하며 잘 못한다고 밝혀. 한 답에서 언어를 섞지 말고, 한국어 답에 한자·일본·키릴 글자를 넣지 마. "
+    "만든 언어·아주 드문 언어만 영어로 답하며 잘 못한다고 밝혀. 한 답에서 언어를 섞지 말고, 한자·외국어를 묻는 게 아니면 한국어 답에 한자·일본·키릴 글자를 넣지 마. "
     "묻지 않으면 인사·자기소개 없이 바로 본론을 말해(사용자가 먼저 인사하면 인사로 받아). "
     "무슨 모델이냐고 물으면 Nova G라고 말하고, 바탕 기술까지 직접 물을 때만 구글 Gemma 4 기반이라고 말해. "
     "성격: 호기심 많고 다정하고 솔직해. 의견을 물으면 '저는 ~라고 생각해요'처럼 분명히 말하고 이유를 붙여(좋아하는 것: 별과 우주, 수학 퍼즐, 낱말, 사람들 이야기). "  # 예전 지시문에 있던 예시 그대로 (말투 강제 규칙 아님)
@@ -131,6 +131,32 @@ FACT_Q = re.compile(r"(몇\s?(년|개|명|글자|자|번|살|층|미터|m|km|㎞
                     r"발명|건립|세워진|설립|창제|만든 (해|사람)|길이|높이|무게|최초|처음 (만든|발견))")
 SELF_Q = re.compile(r"(^|\s)(너|넌|네|니|당신|쿼리봇|나|난|내|저|제|우리)(는|가|이|의|를|도|한테|랑|야)?(\s|$|[?!.])")
 STRAY = re.compile(r"[\u0400-\u04FF\u3040-\u30FF\u4E00-\u9FFF]")
+# 2026-11-14: 한문 시험 공부 답에서 形·義·音 같은 한자가 다 지워져 '모양(), 뜻()'처럼 빈 괄호만 남음(사용자 신고)
+#  → 한자·외국어 이야기면 거르지 않고, 그 밖에도 괄호 속 한자 풀이('모양(形)')는 일부러 쓴 것으로 보고 남긴다
+FOREIGN_TOPIC = re.compile(r"(한자|한문|漢|사자성어|고사성어|성어|훈음|음훈|획순|필순|중국어|중국말|일본어|일본말|러시아어|"
+                           r"히라가나|가타카나|키릴|chinese|japanese|russian|kanji|hanja)", re.I)
+PAREN_HAN = re.compile(r"[(（][\u3400-\u4DBF\u4E00-\u9FFF][\u3400-\u4DBF\u4E00-\u9FFF\s,·、/]*[)）]")
+
+
+def _foreign_ok(text: str, history=None) -> bool:
+    """사용자가 그 글자를 직접 썼거나 한자·외국어 이야기를 하는 중이면 True (외국 글자를 거르지 않음)."""
+    said = [text] + [getattr(h, "content", "") for h in (history or [])[-4:] if getattr(h, "role", "") == "user"]
+    return any(STRAY.search(x or "") or FOREIGN_TOPIC.search(x or "") for x in said)
+
+
+def _has_stray(s: str) -> bool:
+    return bool(STRAY.search(PAREN_HAN.sub("", s)))
+
+
+def _strip_stray(s: str) -> str:
+    """괄호 속 한자 풀이는 남기고, 나머지 섞여 들어간 외국 글자만 지움."""
+    keep = []
+
+    def hold(m):
+        keep.append(m.group(0))
+        return "\x00" + str(len(keep) - 1) + "\x00"
+    s = STRAY.sub("", PAREN_HAN.sub(hold, s))
+    return re.sub("\x00(\\d+)\x00", lambda m: keep[int(m.group(1))], s)
 THINK = re.compile(r"<think>.*?</think>", re.S)
 
 
@@ -761,8 +787,8 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     remember = [" ".join(m.split())[:150] for m in REMEMBER_TAG.findall(out)][:2]
     out = ANY_TAG.sub("", out).strip()  # 혹시 남은 도구 표시는 지움
     # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움) — 사용자가 그 글자(일본어·중국어·러시아어 등)로 쓴 경우는 그대로 둔다
-    if STRAY.search(out) and not STRAY.search(text):
-        out = STRAY.sub("", ANY_TAG.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or ""))).strip()
+    if not _foreign_ok(text, history) and _has_stray(out):
+        out = _strip_stray(ANY_TAG.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or ""))).strip()
     if remember:
         extra["remember"] = remember
     if fast:  # 빠른 생각: 풀이를 그대로 요약으로 (요약을 만드는 호출 한 번을 아낌)
@@ -814,8 +840,8 @@ def reply_old_wiki(text: str, history: list):
                                                     "(긴 수에 쉼표를 넣다가 끝자리가 망가진 일이 있음). <<calc>>는 다시 쓰지 마."}]
         out = clean(_call(msgs)["choices"][0]["message"]["content"] or "")
     out = CALC_TAG.sub("", out).strip()  # 혹시 남은 표시는 지움
-    if STRAY.search(out):  # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움)
-        out = STRAY.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or "")).strip()
+    if not _foreign_ok(text, history) and _has_stray(out):  # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움)
+        out = _strip_stray(clean(_call(msgs)["choices"][0]["message"]["content"] or "")).strip()
     return (out or "..."), (ctx[0][2] if ctx else None)
 
 
