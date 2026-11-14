@@ -158,6 +158,9 @@ def _strip_stray(s: str) -> str:
     s = STRAY.sub("", PAREN_HAN.sub(hold, s))
     return re.sub("\x00(\\d+)\x00", lambda m: keep[int(m.group(1))], s)
 THINK = re.compile(r"<think>.*?</think>", re.S)
+# 2026-11-14 사용자: "쟤가 자기 계정의 남은 사용량 볼 수 있게 해" — 사용량을 물을 때만 오늘 남은 뉴런을 지시문에 넣음(평소엔 글자 아낌)
+USAGE_Q = re.compile(r"(사용량|남은\s*(양|뉴런|횟수|사용|한도)|뉴런|한도|할당량|몇\s*(번|개|회)\s*(더|남)|얼마나\s*(더\s*)?(남|쓸)|"
+                     r"quota|usage|remaining|rate\s*limit)", re.I)
 
 
 # ---------------------------------------------------------
@@ -641,6 +644,11 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     # 프롬프트 캐시(Groq·Cloudflare)는 앞부분이 똑같아야 맞는다 → 늘 같은 규칙(STATIC)을 앞에, 바뀌는 것(날짜·위치·기억·지침)은 뒤에
     system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + REMEMBER_PROMPT
               + " ---- 이번 대화 정보: " + f"오늘은 한국 시각으로 {today_kst()}이야." + wp)
+    if USAGE_Q.search(text or ""):
+        u = usage()
+        system += (f" 오늘 남은 무료 사용량: 뉴런 {u['left']:,}개 / 하루 {u['limit']:,}개({round(100 * u['left'] / u['limit'])}% 남음). "
+                   "이 양은 쿼리봇을 쓰는 모든 사람이 함께 쓰고, 매일 한국 시각 오전 9시에 다시 채워져. 한 사람은 1분에 최대 20번까지 보낼 수 있어. "
+                   "사용자가 사용량·남은 양·한도를 물으면 이 숫자로 짧게 답해. 설정의 '사용량'에서도 볼 수 있어.")
     if older:  # 앞 대화 8개보다 오래된 부분: 사용자가 했던 말을 짧게 (2026-11-11 '오래된 대화는 요약해서')
         system += " 이 대화의 앞부분에서 사용자가 했던 말(오래된 순, 줄임): " + " / ".join("«" + " ".join(str(o).split())[:160] + "»" for o in older[:12]) + ". 필요할 때 이어서 참고해."
     mem = [" ".join(str(m).split())[:150] for m in (memory or []) if str(m).strip()][:MAX_MEMORY]
