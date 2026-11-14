@@ -619,7 +619,7 @@ def _chat_core(body: ChatIn, request: Request):
     if attached:
         if body.model not in SMART_KEYS:
             raise HTTPException(status_code=400, detail="그림·파일 첨부는 Nova G·GPT-OSS에서만 할 수 있어요")
-        if body.model == GROQ_KEY and body.images:
+        if body.model in (GROQ_KEY, RUNPOD_KEY) and body.images:  # 내 서버(RunPod)는 빨리 깨어나려고 글 전용으로 띄움 (2026-11-14)
             raise HTTPException(status_code=400, detail="그림은 Nova G에서만 볼 수 있어요")
         for u in body.images:
             if len(u) > MAX_IMAGE_CHARS or not IMAGE_URL.match(u):
