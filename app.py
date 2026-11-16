@@ -292,7 +292,7 @@ async def limit_body(request: Request, call_next):
     if request.method == "POST":
         length = request.headers.get("content-length", "")
         # /chat은 그림·파일 첨부(그림 4장 + 파일 글자 3만) 때문에 크게, 나머지는 그대로 작게 (2026-11-09)
-        limit = MAX_CHAT_BODY_BYTES if request.url.path == "/chat" else MAX_ACCT_BODY_BYTES if request.url.path == "/acct/push" else MAX_BODY_BYTES
+        limit = MAX_CHAT_BODY_BYTES if request.url.path == "/chat" else MAX_ACCT_BODY_BYTES if request.url.path == "/acct/push" else 1_500_000 if request.url.path == "/feedback" else MAX_BODY_BYTES
         if not length.isdigit() or int(length) > limit:
             return JSONResponse({"detail": "요청이 너무 큼"}, status_code=413)
     return await call_next(request)
@@ -888,6 +888,12 @@ def _chat_core(body: ChatIn, request: Request):
     return out
 
 
+
+# Answer ratings and operator-only review.
+import feedback_routes
+feedback_routes.register(app, read_session, check_rate_limit, client_ip)
+
 if __name__ == "__main__":
     log(f"서버 시작: 0.0.0.0:{PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+
