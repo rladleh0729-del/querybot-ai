@@ -13,8 +13,10 @@ PyTorch 대신 numpy로 모델을 돌린다(np_model.py) — Render 무료 메�
 방문자는 모델을 고르고, '이전 대화 기억'을 켜면 앞 대화(history)를 같이 보낸다.
 서버는 대화를 저장하지 않는다 — 페이지가 들고 있다가 매번 보낸다.
 """
+import base64
 import gc
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -36,6 +38,7 @@ from pydantic import BaseModel, Field
 from np_model import NPModel
 from np_sampling import banned_ids, pick_next, space_id_of
 import wiki_search  # 지식 질문은 위키백과에서 찾아 답함 (2026-10-20)
+import acct_store  # 로그인한 사람의 대화를 Cloudflare D1에 저장 (2026-11-15)
 import cf_chat  # 'Gemma 4'(Cloudflare Workers AI 무료) — 열쇠(CF_ACCOUNT_ID·CF_API_TOKEN)가 있을 때만 목록에 나옴 (2026-11-08)
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -60,6 +63,7 @@ PROMPT_HISTORY = 4       # 그중 모델에 넣는 건 최근 2번 주고받은 
 TEACH_PAIRS_URL = os.environ.get("TEACH_PAIRS_URL", "https://poem-defog-septum.ngrok-free.dev/teach/pairs")
 TEACH_REFRESH_SEC = 300
 MAX_BODY_BYTES = 16384   # 요청 본문 상한 (질문 200자 + 앞 대화 20개)
+MAX_ACCT_BODY_BYTES = 8_000_000  # /acct/push 상한: 대화 묶음 전체(gzip해서 D1 한 칸 2MB 안에 넣음)
 MAX_CHAT_BODY_BYTES = 6_000_000  # /chat 상한: Gemma 4 그림(페이지가 줄여 보내 장당 보통 0.1~0.5MB)·파일 첨부
 MAX_NEW_TOKENS = 80      # 답 자리. 답은 보통 20~40토큰이라 80이면 충분 → 그만큼 앞 대화를 더 넣는다(256 중 176, 2026-10-21)
 MAX_IN_FLIGHT = 3        # 답 만드는 중 1개 + 기다리는 2개까지. 넘치면 바로 "잠시 후"
@@ -288,7 +292,7 @@ async def limit_body(request: Request, call_next):
     if request.method == "POST":
         length = request.headers.get("content-length", "")
         # /chat은 그림·파일 첨부(그림 4장 + 파일 글자 3만) 때문에 크게, 나머지는 그대로 작게 (2026-11-09)
-        limit = MAX_CHAT_BODY_BYTES if request.url.path == "/chat" else MAX_BODY_BYTES
+        limit = MAX_CHAT_BODY_BYTES if request.url.path == "/chat" else MAX_ACCT_BODY_BYTES if request.url.path == "/acct/push" else MAX_BODY_BYTES
         if not length.isdigit() or int(length) > limit:
             return JSONResponse({"detail": "요청이 너무 큼"}, status_code=413)
     return await call_next(request)
@@ -353,6 +357,7 @@ class ChatIn(BaseModel):
     style: str = Field(default="", max_length=20)          # 설정 > 사용자 지침 > 말투 (Gemma 4만)
     instructions: str = Field(default="", max_length=1500)  # 설정 > 사용자 지침 (Gemma 4만, 서버에 저장 안 함)
     older: list[str] = Field(default_factory=list, max_length=12)  # 앞 대화 8개보다 오래된 사용자 말(줄임, 2026-11-11)
+    s: str = Field(default="", max_length=2000)  # 로그인 표 (주인 전용 모델 확인용, 2026-11-15)
     gd: str = Field(default="", max_length=4096)  # 주인 전용 모델을 쓸 때만: Google Drive 로그인 권한(서버가 주인인지 확인, 저장 안 함)
     rid: str = Field(default="", max_length=48)  # 이 질문의 번호 — 답을 만드는 중에 페이지를 닫아도 다시 열면 이어 받게 (2026-11-11)
 
@@ -386,6 +391,7 @@ async def health():
     if cf_chat.ready():
         out["quota"] = cf_chat.usage()  # Gemma 4 오늘 남은 뉴런 (무료 하루 10,000, 한국 오전 9시 초기화)
         out["gemma"] = cf_chat.status()  # Cloudflare 열쇠가 살아 있는지 {ok, reason} (2026-11-10)
+    out["acct"] = {"login": bool(_SESSION_KEY), "store": acct_store.status()["ready"]}  # 로그인·서버 저장 준비 (2026-11-15)
     out["gd_login"] = bool(GOOGLE_CLIENT_SECRET)  # Google Drive 로그인(오래 가는 연결) 준비됐는지 — 페이지가 연결 방식을 고름 (2026-11-11)
     return out
 
@@ -484,6 +490,148 @@ def gd_logout(body: GdRtIn, request: Request):
 
 
 # ---------------------------------------------------------
+# 로그인 + 대화 서버 저장 (2026-11-15 사용자: "무료 서버에서 사용자의 대화 기록과 로그인 정보를 기억해서")
+# Google 로그인(openid·이름·이메일만 — Drive 권한 없음) → 서버가 서명한 '로그인 표'(180일, 브라우저에 보관 = 로그인 기억)
+# → 대화 묶음(Drive 백업과 같은 모양)을 Cloudflare D1에 저장. 서버에 남는 것: uid(Google 계정 번호의 해시)와 대화 묶음뿐.
+# 이메일은 주인 확인에만 쓰고 저장·로그 안 함. 이름·사진 주소는 로그인 표 안에만(서버 저장 안 함)
+# ---------------------------------------------------------
+SESSION_DAYS = 180
+_SESSION_KEY = hashlib.sha256(("qb-session|" + GOOGLE_CLIENT_SECRET).encode("utf-8")).digest() if GOOGLE_CLIENT_SECRET else b""
+
+
+def _acct_setup():
+    st = acct_store.setup()
+    log(f"[계정] 서버 저장소: {'켜짐 (' + st['kind'] + ')' if st['ready'] else '꺼짐 — ' + st['reason']}")
+
+
+threading.Thread(target=_acct_setup, daemon=True).start()
+
+
+def _b64e(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+
+def _b64d(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def make_session(claims: dict) -> str:
+    body = _b64e(json.dumps(claims, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return body + "." + _b64e(hmac.new(_SESSION_KEY, body.encode("ascii"), hashlib.sha256).digest())
+
+
+def read_session(s: str):
+    if not _SESSION_KEY or not s or s.count(".") != 1:
+        return None
+    body, sig = s.split(".")
+    if not hmac.compare_digest(sig, _b64e(hmac.new(_SESSION_KEY, body.encode("ascii"), hashlib.sha256).digest())):
+        return None
+    try:
+        c = json.loads(_b64d(body).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(c, dict) or not c.get("u") or float(c.get("exp") or 0) < time.time():
+        return None
+    return c
+
+
+def session_owner(s: str) -> bool:
+    c = read_session(s) if s else None
+    return bool(c and c.get("o") and OWNER_EMAILS and cf_chat.runpod_ready())
+
+
+def _id_claims(tok: str) -> dict:
+    # Google 토큰 창구에서 TLS로 바로 받은 id_token이라 서명 확인 없이 내용을 읽어도 됨(Google OpenID 문서). 받는 쪽(aud)·발급처(iss)는 확인
+    try:
+        return json.loads(_b64d(tok.split(".")[1]).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+class AcctLoginIn(BaseModel):
+    code: str = Field(min_length=10, max_length=1000)
+
+
+class SessIn(BaseModel):
+    s: str = Field(min_length=20, max_length=2000)
+
+
+class AcctPushIn(BaseModel):
+    s: str = Field(min_length=20, max_length=2000)
+    data: dict
+
+
+def _acct_user(s: str) -> dict:
+    c = read_session(s)
+    if not c:
+        raise HTTPException(status_code=401, detail="로그인이 끝났어요. 다시 로그인해 주세요.")
+    if not acct_store.ready():
+        raise HTTPException(status_code=503, detail="서버 저장소 준비 중")
+    return c
+
+
+@app.post("/acct/login")
+def acct_login(body: AcctLoginIn, request: Request):
+    check_rate_limit(client_ip(request))
+    if not _SESSION_KEY:
+        raise HTTPException(status_code=503, detail="로그인 준비 중")
+    d = _google_token({"code": body.code, "grant_type": "authorization_code", "redirect_uri": "postmessage"})
+    c = _id_claims(str(d.get("id_token") or ""))
+    if not c.get("sub") or c.get("aud") != GOOGLE_CLIENT_ID or c.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        log(f"[로그인] 실패: {d.get('error') or 'id_token 없음'}")
+        raise HTTPException(status_code=400, detail="Google 로그인에 실패했어요. 다시 눌러 주세요.")
+    uid = hashlib.sha256(("qb|" + str(c["sub"])).encode("utf-8")).hexdigest()[:32]
+    email = str(c.get("email") or "").lower()
+    owner = bool(email) and c.get("email_verified") in (True, "true") and email in OWNER_EMAILS
+    name = str(c.get("name") or c.get("given_name") or "")[:60]
+    photo = str(c.get("picture") or "")[:400]
+    s = make_session({"u": uid, "n": name, "p": photo, "o": 1 if owner else 0, "exp": int(time.time()) + SESSION_DAYS * 86400})
+    log("[로그인] 성공" + (" (주인)" if owner else ""))
+    return {"s": s, "name": name, "photo": photo, "owner": owner, "store": acct_store.ready()}
+
+
+@app.post("/acct/pull")
+def acct_pull(body: SessIn, request: Request):
+    check_rate_limit(client_ip(request))
+    c = _acct_user(body.s)
+    try:
+        data, updated = acct_store.load(c["u"])
+    except acct_store.StoreError as e:
+        log(f"[계정] 불러오기 실패: {e}")
+        raise HTTPException(status_code=502, detail="서버 저장소에 잠시 연결할 수 없어요")
+    return {"data": data, "updated": updated}
+
+
+@app.post("/acct/push")
+def acct_push(body: AcctPushIn, request: Request):
+    check_rate_limit(client_ip(request))
+    c = _acct_user(body.s)
+    if not isinstance(body.data.get("convs"), list):
+        raise HTTPException(status_code=400, detail="대화 묶음 모양이 아니에요")
+    try:
+        updated = acct_store.save(c["u"], body.data)
+    except acct_store.TooBig:
+        raise HTTPException(status_code=413, detail="대화가 너무 많아 서버에 다 담을 수 없어요. 오래된 대화를 지워 주세요.")
+    except acct_store.StoreError as e:
+        log(f"[계정] 저장 실패: {e}")
+        raise HTTPException(status_code=502, detail="서버 저장소에 잠시 연결할 수 없어요")
+    return {"ok": True, "updated": updated}
+
+
+@app.post("/acct/delete")
+def acct_delete(body: SessIn, request: Request):
+    check_rate_limit(client_ip(request))
+    c = _acct_user(body.s)
+    try:
+        acct_store.delete(c["u"])
+    except acct_store.StoreError as e:
+        log(f"[계정] 지우기 실패: {e}")
+        raise HTTPException(status_code=502, detail="서버 저장소에 잠시 연결할 수 없어요")
+    log("[계정] 서버 대화 모두 지움")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------
 # 주인 확인 (2026-11-14) — RunPod 모델은 주인 돈이 나가서 주인 계정(OWNER_EMAILS)으로 로그인했을 때만 보이고 쓸 수 있다.
 # 페이지가 Drive 로그인 권한을 보내면 Google Drive about(user.emailAddress)로 이메일을 확인. 토큰·이메일은 저장·로그 안 함(해시로 결과만 50분)
 # ---------------------------------------------------------
@@ -518,13 +666,14 @@ def is_owner(token: str) -> bool:
 
 
 class OwnerIn(BaseModel):
-    gd: str = Field(min_length=10, max_length=4096)
+    gd: str = Field(default="", max_length=4096)
+    s: str = Field(default="", max_length=2000)
 
 
 @app.post("/owner")
 def owner_check(body: OwnerIn, request: Request):
     check_rate_limit(client_ip(request))
-    if not is_owner(body.gd):
+    if not (session_owner(body.s) or is_owner(body.gd)):
         return {"owner": False, "models": []}
     return {"owner": True, "models": [{"key": RUNPOD_KEY, "label": RUNPOD_LABEL}]}
 
@@ -533,7 +682,7 @@ def owner_check(body: OwnerIn, request: Request):
 def owner_warm(body: OwnerIn, request: Request):
     # 모델을 고르는 순간 서버를 미리 깨움 (질문을 쓰는 동안 1분 안팎의 깨어나는 시간을 넘김)
     check_rate_limit(client_ip(request))
-    if not is_owner(body.gd):
+    if not (session_owner(body.s) or is_owner(body.gd)):
         raise HTTPException(status_code=403, detail="주인 계정으로 로그인했을 때만 쓸 수 있어요")
     threading.Thread(target=cf_chat.runpod_warm, daemon=True).start()
     return {"ok": True}
@@ -648,7 +797,7 @@ def _chat_core(body: ChatIn, request: Request):
         elif body.model in SMART_KEYS:
             if (body.model == GEMMA_KEY and not cf_chat.ready()) or (body.model == GROQ_KEY and not cf_chat.groq_ready()):
                 raise HTTPException(status_code=400, detail="없는 모델")
-            if body.model == RUNPOD_KEY and not is_owner(body.gd):
+            if body.model == RUNPOD_KEY and not (session_owner(body.s) or is_owner(body.gd)):
                 raise HTTPException(status_code=403, detail="이 모델은 주인 계정으로 로그인했을 때만 쓸 수 있어요")
             args = dict(think=body.think, memory=body.memory, location=body.location.model_dump() if body.location else None,
                         style=body.style, instructions=body.instructions, older=[str(o)[:200] for o in body.older])
