@@ -21,6 +21,7 @@ import calc_tool
 import weather
 import web_search
 import wiki_search
+import kb  # 지식 창고: 평가원 수능 수학 기출 (2026-11-22)
 
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
@@ -977,6 +978,11 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     # 규칙은 사용자 말 바로 뒤에도 한 번 더 붙임: 지시문에만 두면 '세 문장 이내' 같은 규칙이 기본 길이 안내에 밀려 6번 중 1번만 지켜짐(2026-11-22 시험)
     rule_note = ("\n\n(내가 전에 정해 둔 규칙이야. 질문이 무엇이든 이번 답도 반드시 지키고, 규칙 얘기는 꺼내지 마: "
                  + " ".join(f"({i + 1}) {r}" for i, r in enumerate(rules)) + ")") if rules else ""
+    # 지식 창고 (2026-11-22): 기출 번호를 말하면 답하기 전에 원문을 넣어 줌 — 인터넷 검색보다 정확하고 호출이 늘지 않음
+    kb_hits = kb.lookup(text)
+    if kb_hits:
+        msgs[0] = {"role": "system", "content": msgs[0]["content"] + " " + kb.note(kb_hits)}
+        system_plain += " " + kb.note(kb_hits)
     msgs.append({"role": "user", "content": _content(text + rule_note, images, files)})
     t0 = time.time()
     # 생각하기는 시간을 정해도 토큰 한도를 줄이지 않는다 (예전엔 '10초'면 400토큰이라 생각+답이 잘림, 2026-11-09 사용자 신고).
@@ -1045,6 +1051,8 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
         d = _call(msgs)
         out = _finish(msgs, d, clean(d["choices"][0]["message"]["content"] or ""))
     extra, calcs, searched, weathered = {}, 0, False, False
+    if kb_hits:
+        extra["sources"] = kb.sources(kb_hits)
     for _ in range(4):  # 도구는 한 질문에 날씨 1번 + 검색 1번 + 계산 2번까지
         mw = WEATHER_TAG.search(out) if not weathered else None
         ms = SEARCH_TAG.search(out) if USE_SEARCH and not searched else None
@@ -1066,11 +1074,18 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
         elif ms:
             searched = True
             q = ms.group(1).strip()[:120]
-            found = web_search.search(q)
-            note = _search_note(q, found, len(extra.get("sources", [])))
-            if found:
-                extra.setdefault("sources", []).extend({"title": x["title"], "url": x["url"]} for x in found)
+            kh = kb.lookup(q, search=True)  # 지식 창고 먼저, 없으면 인터넷 (2026-11-22)
+            if kh:
+                note = kb.note(kh)
+                extra.setdefault("sources", []).extend(kb.sources(kh))
                 extra["searched"] = q
+                log(f"지식 창고에서 찾음 {len(kh)}개")
+            else:
+                found = web_search.search(q)
+                note = _search_note(q, found, len(extra.get("sources", [])))
+                if found:
+                    extra.setdefault("sources", []).extend({"title": x["title"], "url": x["url"]} for x in found)
+                    extra["searched"] = q
             msgs += [{"role": "assistant", "content": ms.group(0)}, {"role": "user", "content": note}]
         elif mc:
             calcs += 1
