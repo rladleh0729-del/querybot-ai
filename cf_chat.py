@@ -98,6 +98,18 @@ THINK_MAX_TOKENS = 2400  # (2026-11-11) 4,000이면 어림 문제에서 생각�
 _THINK_MAX_OLD = 4000  # 생각(보통 1,000~1,500토큰) + 답. 모자라면 생각만 하고 답이 비거나 답이 중간에 끊김(2026-11-08, 11-09)
 # 기억 (2026-11-09): 사용자가 알려 준 이름·취향 같은 것은 모델이 <<remember: …>>로 내고, 페이지가 이 브라우저에 저장해 다음 대화부터 같이 보낸다
 REMEMBER_TAG = re.compile(r"<<\s*remember\s*:\s*(.+?)\s*>>", re.S | re.I)
+# 브라우저 도구 (2026-11-22): 사용자 브라우저에 확장 '쿼리봇 브라우저 도구'가 있을 때만(페이지가 browser=true) 안내하고,
+# 모델이 <<browser: 할 일>>을 쓰면 답 대신 그 할 일을 페이지에 돌려준다(페이지가 확장 + /agent/step으로 실제로 함)
+BROWSER_TAG = re.compile(r"<<\s*browser\s*:\s*(.+?)\s*>>", re.S | re.I)
+BROWSER_PROMPT = (
+    " (브라우저 도구) 이 사용자는 브라우저에 '쿼리봇 브라우저 도구'를 설치해 둬서, 네가 사용자의 브라우저를 직접 다룰 수 있어 "
+    "(새 탭 열기, 사이트 열기·이동, 사이트의 검색창으로 검색하기, 지금 보는 페이지나 연 탭 읽고 요약하기, 단추 누르기, 칸에 글 쓰기, 탭 닫기). "
+    "사용자가 브라우저에서 해야 하는 일을 부탁하면 — 예: 새 탭 열어 줘, 유튜브 열어 줘, 네이버에서 ○○ 검색해 줘, 지금 보는 페이지 요약해 줘, "
+    "거기서 ○○ 눌러 줘, 앞 대화에서 연 탭으로 이어서 하는 일 — '못 한다'고 하지 말고 다른 말 없이 한 줄로 <<browser: 할 일>> 만 써. "
+    "할 일은 앞 대화를 반영해 한 문장으로 구체적으로 써(예: <<browser: 새 탭 하나 열기>>, <<browser: 열어 둔 구글 탭에서 아무 검색어로 검색하기>>). "
+    "그러면 브라우저 도구가 그 일을 하고 결과를 사용자에게 보여 줘. 그냥 지식 질문·대화·글쓰기는 평소처럼 답하고, "
+    "어떤 사이트에서 하라는 말 없이 정보만 필요한 질문은 지금처럼 <<search>>를 써."
+)
 MAX_MEMORY = 30
 REMEMBER_PROMPT = (
     " 사용자가 알려 준 이름·취향·하는 일과 네 답에 대한 지적은 시스템이 따로 골라 자동으로 기억에 저장해(저장되면 답 아래에 표시됨). "
@@ -720,17 +732,17 @@ MAX_INSTR = 1500
 
 
 def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
-          style: str = "", instructions: str = "", provider: str = "cf", older=None):
+          style: str = "", instructions: str = "", provider: str = "cf", older=None, browser: bool = False):
     """provider = "cf"(Gemma 4, Cloudflare) 또는 "groq"(gpt-oss-120b). older = 앞 대화 8개보다 오래된 사용자 말(줄임). 나머지는 _reply 설명 그대로."""
     tok = _provider.set("groq" if provider == "groq" and groq_ready() else "runpod" if provider == "runpod" and runpod_ready() else "cf")
     try:
-        return _reply(text, history, images, files, think, memory, location, style, instructions, older or [])
+        return _reply(text, history, images, files, think, memory, location, style, instructions, older or [], browser)
     finally:
         _provider.reset(tok)
 
 
 def _reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
-           style: str = "", instructions: str = "", older=None):
+           style: str = "", instructions: str = "", older=None, browser: bool = False):
     """(답, 덧붙일 정보 또는 None). 덧붙일 정보 = {"sources": [{title, url}], "searched": 검색어,
     "thought": {"seconds", "summary", "asked"}, "remember": [새로 기억할 한 줄]}.
     history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}],
@@ -763,6 +775,8 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     # 프롬프트 캐시(Groq·Cloudflare)는 앞부분이 똑같아야 맞는다 → 늘 같은 규칙(STATIC)을 앞에, 바뀌는 것(날짜·위치·기억·지침)은 뒤에
     system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + REMEMBER_PROMPT
               + " ---- 이번 대화 정보: " + f"오늘은 한국 시각으로 {today_kst()}이야." + wp)
+    if browser:
+        system += BROWSER_PROMPT
     if USAGE_Q.search(text or ""):
         u = usage()
         system += (f" 오늘 남은 무료 사용량: 뉴런 {u['left']:,}개 / 하루 {u['limit']:,}개({round(100 * u['left'] / u['limit'])}% 남음). "
@@ -845,6 +859,17 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
         d1 = _call(msgs)
     first = d1["choices"][0]["message"]
     raw = first.get("content") or ""
+    if browser:
+        mb = BROWSER_TAG.search(raw)
+        if mb:  # 브라우저에서 할 일 → 답 대신 할 일만 돌려줌(페이지가 확장으로 하고, 결과 문장을 답으로 보여 줌)
+            extra = {"browser_task": " ".join(mb.group(1).split())[:300] or " ".join(str(text).split())[:300]}
+            mr = mem_job.result() if mem_job else None
+            if mr is not None:
+                if mr["add"]:
+                    extra["remember"] = mr["add"]
+                if mr["forget"]:
+                    extra["forget"] = mr["forget"]
+            return "", extra
     reasoning = (first.get("reasoning_content") or "").strip() if think else ""
     fast_note = ""
     if fast:  # 빠른 생각: <<생각>> … <</생각>> 를 떼어 생각 요약으로

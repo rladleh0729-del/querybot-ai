@@ -360,6 +360,7 @@ class ChatIn(BaseModel):
     s: str = Field(default="", max_length=2000)  # 로그인 표 (주인 전용 모델 확인용, 2026-11-15)
     gd: str = Field(default="", max_length=4096)  # 주인 전용 모델을 쓸 때만: Google Drive 로그인 권한(서버가 주인인지 확인, 저장 안 함)
     rid: str = Field(default="", max_length=48)  # 이 질문의 번호 — 답을 만드는 중에 페이지를 닫아도 다시 열면 이어 받게 (2026-11-11)
+    browser: bool = False  # 사용자 브라우저에 '쿼리봇 브라우저 도구' 확장이 있음 → 필요하면 모델이 <<browser: 할 일>> (2026-11-22)
 
 
 IMAGE_URL = re.compile(r"^data:image/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$")
@@ -800,7 +801,8 @@ def _chat_core(body: ChatIn, request: Request):
             if body.model == RUNPOD_KEY and not (session_owner(body.s) or is_owner(body.gd)):
                 raise HTTPException(status_code=403, detail="이 모델은 주인 계정으로 로그인했을 때만 쓸 수 있어요")
             args = dict(think=body.think, memory=body.memory, location=body.location.model_dump() if body.location else None,
-                        style=body.style, instructions=body.instructions, older=[str(o)[:200] for o in body.older])
+                        style=body.style, instructions=body.instructions, older=[str(o)[:200] for o in body.older],
+                        browser=bool(body.browser) and body.model in (GEMMA_KEY, RUNPOD_KEY))  # 브라우저 도구는 Gemma만(행동 형식 학습)
             try:
                 if body.model == RUNPOD_KEY:
                     try:
@@ -862,6 +864,8 @@ def _chat_core(body: ChatIn, request: Request):
         kind += f" [기억 +{len(extra.get('remember') or [])} −{len(extra.get('forget') or [])}]"  # 기억 내용은 남기지 않는다
     if body.location:
         kind += " [위치]"  # 좌표·동네 이름은 남기지 않는다
+    if extra and extra.get("browser_task"):
+        kind += " [브라우저 도구로]"  # 할 일 내용은 남기지 않는다
     if extra and extra.get("fallback"):
         kind += " [GPT-OSS 한도·오류 → Nova G가 대신]" if extra["fallback"] == "groq→gemma" else " [RunPod 실패 → Nova G가 대신]" if extra["fallback"] == "runpod→gemma" else f" [Gemma 실패 → 기본 모델: {extra['fallback']}]"
     log(f"[{body.model}] 질문 {len(text)}자, 앞 대화 {kept}턴 → 답 {len(reply)}자{kind} ({time.time() - t0:.1f}초)")
@@ -883,6 +887,8 @@ def _chat_core(body: ChatIn, request: Request):
             out["forget"] = extra["forget"]  # 페이지가 지울 기억(취향이 바뀌었거나 잊으라고 함, 2026-11-22)
         if extra.get("fallback"):
             out["fallback"] = extra["fallback"]  # Gemma 4 대신 기본 모델이 답함 (AuthError·QuotaError·Busy)
+        if extra.get("browser_task"):
+            out["browser_task"] = extra["browser_task"]  # 페이지가 확장(쿼리봇 브라우저 도구)과 /agent/step으로 실제로 함 (2026-11-22)
         if extra.get("ask_location"):
             out["ask_location"] = True  # 위치를 몰라 지역을 물음 → 페이지가 답 아래에 '위치 공유 켜기' 단추 (2026-11-14)
     if body.model == GEMMA_KEY:
