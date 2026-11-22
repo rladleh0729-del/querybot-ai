@@ -124,18 +124,43 @@ def _host(u: str) -> str:
         return ""
 
 
-def _kakao(q: str) -> list:
-    """카카오 Daum 웹문서 검색 (환경변수 KAKAO_REST_API_KEY, 무료 하루 30,000건, 2026-11-09 사용자 추천). 한국어 결과가 가장 좋음.
-    결과마다 작성일(date)을 붙여 모델이 오래된 자료를 알아보게 한다."""
-    fresh = bool(TIME_WORDS.search(q))
-    url = "https://dapi.kakao.com/v2/search/web?" + urllib.parse.urlencode({"query": q, "size": 10, "sort": "recency" if fresh else "accuracy"})
+def _kakao_one(kind: str, q: str, size: int, fresh: bool) -> list:
+    """카카오 Daum 검색 한 종류(web·blog). 결과마다 작성일(date)을 붙여 모델이 오래된 자료를 알아보게 한다."""
+    url = f"https://dapi.kakao.com/v2/search/{kind}?" + urllib.parse.urlencode({"query": q, "size": size, "sort": "recency" if fresh else "accuracy"})
     req = urllib.request.Request(url, headers={"Authorization": "KakaoAK " + KAKAO_KEY})
     with urllib.request.urlopen(req, timeout=6) as r:
         d = json.loads(r.read().decode("utf-8"))
-    out = [{"title": _strip(x.get("title"))[:120], "url": x.get("url") or "", "snippet": _strip(x.get("contents"))[:400],
-            "date": (x.get("datetime") or "")[:10]}
-           for x in d.get("documents") or [] if (x.get("url") or "").startswith("http")]
-    out.sort(key=lambda x: bool(LOW_QUALITY.search(_host(x["url"]))))  # 순서는 그대로 두고 커뮤니티 글만 뒤로
+    return [{"title": _strip(x.get("title"))[:120], "url": x.get("url") or "", "snippet": _strip(x.get("contents"))[:400],
+             "date": (x.get("datetime") or "")[:10]}
+            for x in d.get("documents") or [] if (x.get("url") or "").startswith("http")]
+
+
+def _kakao(q: str) -> list:
+    """카카오 Daum 웹문서 + 블로그 검색 (환경변수 KAKAO_REST_API_KEY, 무료, 2026-11-09 사용자 추천). 한국어 결과가 가장 좋음.
+    블로그(2026-11-22 사용자: '카카오 블로그 먼저')는 풀이·후기·정리 글이 많아 웹문서 사이사이에 섞는다."""
+    fresh = bool(TIME_WORDS.search(q))
+    with concurrent.futures.ThreadPoolExecutor(2) as ex:
+        fw = ex.submit(_kakao_one, "web", q, 10, fresh)
+        fb = ex.submit(_kakao_one, "blog", q, 6, fresh)
+        err = None
+        try:
+            web = fw.result()
+        except Exception as e:  # noqa: BLE001
+            web, err = [], e
+        try:
+            blog = fb.result()
+        except Exception as e:  # noqa: BLE001 — 블로그가 안 돼도 웹문서만으로
+            blog = []
+            log(f"kakao 블로그 실패: {type(e).__name__} {str(e)[:60]}")
+    if err and not blog:
+        raise err
+    web.sort(key=lambda x: bool(LOW_QUALITY.search(_host(x["url"]))))  # 순서는 그대로 두고 커뮤니티 글만 뒤로
+    out, seen = [], set()
+    for i in range(max(len(web), len(blog))):  # 웹·블로그를 번갈아 (위 5개에 웹 3·블로그 2 정도)
+        for x in (web[i] if i < len(web) else None, blog[i] if i < len(blog) else None):
+            if x and x["url"] not in seen:
+                seen.add(x["url"])
+                out.append(x)
     return out
 
 
