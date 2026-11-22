@@ -148,7 +148,7 @@ QUIZ_ASK = re.compile(r"퀴즈|quiz|문제(?:를|좀|\s|\d|개|하나|두|세|�
                       r"테스트\s?해|시험\s?(문제|봐|쳐)", re.I)  # 이런 말이 있을 때만 퀴즈 지시를 넣음 (2026-11-22)
 LATEX_CMD = re.compile(r"(?<!\\)\\(?=(?:d?frac|times|div|sqrt|cdot|cdots|ldots|dots|left|right|pm|mp|le|leq|ge|geq|neq|approx|infty|int|sum|prod|lim|log|ln|sin|cos|tan|"
                        r"alpha|beta|gamma|theta|pi|sigma|omega|text|mathrm|quad|binom|vec|overline|angle|triangle|circ|to|rightarrow|Rightarrow|cup|cap|in|subset)\b)")
-QUIZ_BLOCK = re.compile(r"```\s*(?:quiz|퀴즈)\s*\n([\s\S]*?)```", re.I)
+QUIZ_BLOCK = re.compile(r"```[ \t]*(?:quiz|퀴즈)[ \t]*\n?([\s\S]*?)```", re.I)  # 'quiz {…}'처럼 같은 줄에 써도 (2026-11-22)
 
 
 def _fix_quiz(out: str) -> str:
