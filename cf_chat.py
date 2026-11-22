@@ -31,11 +31,14 @@ MAX_TOKENS = 2000
 CONTINUE_MAX = 2        # 이어 쓰기 최대 횟수
 CONTINUE_NOTE = "답이 길이 제한 때문에 중간에 끊겼어. 이미 쓴 부분은 되풀이하지 말고, 끊긴 바로 그 자리(글자)부터 이어서 끝까지 써."
 CUT_NOTE = "\n\n(답이 길어서 여기까지만 썼어요.)"
+CONTINUE_MAX_FILE = 4   # 파일 블록을 쓰다 끊기면 더 많이 이어 씀 (2026-11-22 사용자: "500줄 자리 파이썬 파일 줘"에 10줄만)
+# 파일은 반쯤 쓴 마지막 줄을 버리고 다음 줄 맨 앞부터 쓰게 함 — 글자 단위로 이으라 하면 'x262 =' 뒤에 '263 = 0'을 써서 줄이 빠졌음(2026-11-22 시험)
+CONTINUE_FILE_NOTE = "파일을 쓰다가 길이 제한 때문에 끊겼어. 이미 쓴 줄은 되풀이하지 말고, 마지막 줄의 바로 다음 줄부터 줄 맨 앞부터 이어서 파일 끝까지 써. 파일 머리줄(```file:)은 다시 쓰지 마."
 TEMPERATURE = 0.6
 HISTORY_TURNS = 8       # 앞 대화는 최근 8개(4번 주고받기)까지 (2026-11-10 사용자: "전 대화 기억 한도도 조금 더 늘려" — 6개·600자 → 8개·1,000자)
 HISTORY_CHARS = 1000    # 앞 대화 한 줄에 붙이는 글자 수 (긴 풀이·코드 답도 이어서 물을 수 있게)
 HANGUL = re.compile(r"[가-힣]")
-TIMEOUT = 60
+TIMEOUT = 90  # 60 → 90 (2026-11-22): Cloudflare가 초당 ~42토큰이라 2,000토큰 한 번에 48초 — 60초는 빠듯
 THINK_TIMEOUT = 130  # 생각하기는 Cloudflare가 1초에 35~60토큰이라 4,000토큰이면 60초를 넘을 수 있다 (2026-11-09 PC 시험에서 60초 시간 초과). 페이지는 150초 기다림
 
 SYSTEM_PROMPT = (
@@ -119,6 +122,7 @@ FILE_PROMPT = (
     "(.xlsx·.docx·.png 같은 바이너리 파일은 못 만드니 그렇게 바꿔 만든다고 한 줄로 알려). 여러 파일이면 블록을 여러 개 쓰고, 블록 밖에는 짧은 설명만. "
     "파일 안에 ```가 들어가야 하면 대신 ~~~를 써. 앞 답의 파일을 고쳐 달라고 하면 고친 파일 전체를 같은 이름으로 다시 줘. "
     "받은 .csv에는 엑셀에서 한글이 안 깨지게 BOM이 붙으니, csv를 읽는 코드를 만들 땐 encoding='utf-8-sig'로 열어. "
+    "파일은 요청한 줄 수·분량을 줄이지 말고 끝까지 다 써 — 길면 서버가 끊긴 자리부터 이어 쓰게 해 주니, 길다는 이유로 일부만 쓰거나 반복문·예시로 바꾸자고 하지 마. "
     "짧은 예시 코드나 설명용 코드는 지금처럼 ```언어 로."
 )
 FILE_FENCE = re.compile(r"```\s*(file|파일)\s*[:：]", re.I)
@@ -719,21 +723,39 @@ def make_title(message: str, reply: str = "") -> str:
     return t[:40]
 
 
+def _open_file_block(s: str) -> bool:
+    """글 끝이 아직 닫히지 않은 ```file: 블록 안이면 True (2026-11-22)"""
+    info = None
+    for m in re.finditer(r"^[ \t]*```([^\n]*)$", s, re.M):
+        info = m.group(1) if info is None else None
+    return info is not None and bool(FILE_FENCE.match("```" + info))
+
+
 def _finish(msgs: list, d: dict, out: str) -> str:
-    """답이 한도에 걸려 끊겼으면(finish_reason == "length") 끊긴 자리부터 이어 쓰게 해서 붙인다. 그래도 끊기면 끝에 표시."""
+    """답이 한도에 걸려 끊겼으면(finish_reason == "length") 끊긴 자리부터 이어 쓰게 해서 붙인다. 그래도 끊기면 끝에 표시.
+    파일 블록을 쓰는 중이면 더 많이(CONTINUE_MAX_FILE) 이어 쓰고, 끝내 못 끝내면 블록을 닫아 받기 단추가 붙게 한다(2026-11-22)."""
     fin = d["choices"][0].get("finish_reason") or ""
     n = 0
-    while fin == "length" and out and n < CONTINUE_MAX:
+    while fin == "length" and out and n < (CONTINUE_MAX_FILE if _open_file_block(out) else CONTINUE_MAX):
         n += 1
-        d = _call(msgs + [{"role": "assistant", "content": out}, {"role": "user", "content": CONTINUE_NOTE}])
+        in_file = _open_file_block(out)
+        if in_file and "\n" in out and not out.endswith("\n"):
+            out = out[:out.rfind("\n") + 1]  # 반쯤 쓴 마지막 줄은 버리고 다음 줄부터 새로
+        d = _call(msgs + [{"role": "assistant", "content": out}, {"role": "user", "content": CONTINUE_FILE_NOTE if in_file else CONTINUE_NOTE}])
         more = clean(d["choices"][0]["message"]["content"] or "")
         fin = d["choices"][0].get("finish_reason") or ""
+        if in_file:
+            more = more.lstrip("\n")
+        if in_file and FILE_FENCE.match(more.lstrip()):  # 이어 쓰다 파일 머리줄(```file:이름)을 다시 쓰면 뗌
+            more = more.lstrip().split("\n", 1)[1] if "\n" in more.lstrip() else ""
         if not more:
             break
         out += more
     if n:
         log(f"이어 쓰기 {n}번 ({'그래도 끊김' if fin == 'length' else '끝까지'})")
     if fin == "length" and out:
+        if _open_file_block(out):
+            out = out.rstrip("\n") + "\n```"
         out += CUT_NOTE
     return out
 
