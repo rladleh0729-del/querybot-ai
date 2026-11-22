@@ -113,6 +113,15 @@ BROWSER_PROMPT = (
     "그러면 브라우저 도구가 그 일을 하고 결과를 사용자에게 보여 줘. 그냥 지식 질문·대화·글쓰기는 평소처럼 답하고, "
     "어떤 사이트에서 하라는 말 없이 정보만 필요한 질문은 지금처럼 <<search>>를 써."
 )
+# 사용자가 브라우저로 하라고 분명히 말함 (2026-11-22: '브라우저에서 검색해도 돼'·'직접 검색해'·'확장 프로그램으로'에 웹 검색을 골라 버림)
+BROWSER_FORCE = re.compile(r"(브라우저|확장\s*프로그램|확장으로|확장\s*(을|를)?\s*(써|사용|이용)|직접\s*(검색|찾|들어가|열|봐|확인)|열어서|들어가서|"
+                           r"탭에서|그\s*탭|본\s*화면|화면에\s*(나온|나왔|있|뜬|보인)|화면\s*(봐|보고|읽)|\b(browser|extension)\b)", re.I)
+BROWSER_FORCE_NOTE = (" 이번 사용자 말은 브라우저 도구로 하라는 뜻이야(브라우저·확장·직접 검색·화면을 말함). <<search>>도 답도 쓰지 말고 반드시 "
+                      "<<browser: 할 일>> 한 줄만 써. 할 일에는 앞 대화에서 사용자가 원래 물은 것을 넣어 "
+                      "(예: <<browser: 구글에서 ○○를 검색해 결과 화면에서 ○○ 읽기>>).")
+BROWSER_RECENT_NOTE = (" 바로 앞 답은 브라우저 도구로 사용자 브라우저 화면(쿼리봇 탭 묶음에 열어 둔 탭)을 보고 한 거야. "
+                       "사용자가 그 화면·결과를 더 물으면(무엇이었는지, 문제 자체, 식, 자세히, 네가 본 것 등) <<search>>로 새로 찾지 말고 "
+                       "<<browser: 열어 둔 탭 화면을 다시 읽고 ○○ 답하기>>를 써. 화면과 상관없는 새 질문이면 평소처럼.")
 # 파일 만들기 (2026-11-22 사용자: "코드, 다른 텍스트 같은 파일들을 AI가 만들 수 있는 기능") — 페이지가 ```file:이름 블록을 받기 카드로 그림
 FILE_PROMPT = (
     " 파일 만들기: 사용자가 파일로 달라고 하거나(코드 파일·문서·표·설정 파일·웹페이지 등) 저장해서 바로 쓸 완성된 결과물을 원하면, "
@@ -841,17 +850,17 @@ MAX_INSTR = 1500
 
 
 def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
-          style: str = "", instructions: str = "", provider: str = "cf", older=None, browser: bool = False):
+          style: str = "", instructions: str = "", provider: str = "cf", older=None, browser: bool = False, browser_recent: bool = False):
     """provider = "cf"(Gemma 4, Cloudflare) 또는 "groq"(gpt-oss-120b). older = 앞 대화 8개보다 오래된 사용자 말(줄임). 나머지는 _reply 설명 그대로."""
     tok = _provider.set("groq" if provider == "groq" and groq_ready() else "runpod" if provider == "runpod" and runpod_ready() else "cf")
     try:
-        return _reply(text, history, images, files, think, memory, location, style, instructions, older or [], browser)
+        return _reply(text, history, images, files, think, memory, location, style, instructions, older or [], browser, browser_recent)
     finally:
         _provider.reset(tok)
 
 
 def _reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
-           style: str = "", instructions: str = "", older=None, browser: bool = False):
+           style: str = "", instructions: str = "", older=None, browser: bool = False, browser_recent: bool = False):
     """(답, 덧붙일 정보 또는 None). 덧붙일 정보 = {"sources": [{title, url}], "searched": 검색어,
     "thought": {"seconds", "summary", "asked"}, "remember": [새로 기억할 한 줄]}.
     history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}],
@@ -887,8 +896,13 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + REMEMBER_PROMPT
               + (FILE_PROMPT if want_file else "")
               + " ---- 이번 대화 정보: " + f"오늘은 한국 시각으로 {today_kst()}이야." + wp)
+    force_browser = bool(browser and BROWSER_FORCE.search(text or ""))
     if browser:
         system += BROWSER_PROMPT
+        if browser_recent:
+            system += BROWSER_RECENT_NOTE
+        if force_browser:
+            system += BROWSER_FORCE_NOTE
     if USAGE_Q.search(text or ""):
         u = usage()
         system += (f" 오늘 남은 무료 사용량: 뉴런 {u['left']:,}개 / 하루 {u['limit']:,}개({round(100 * u['left'] / u['limit'])}% 남음). "
@@ -981,8 +995,12 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     raw = first.get("content") or ""
     if browser:
         mb = BROWSER_TAG.search(raw)
-        if mb:  # 브라우저에서 할 일 → 답 대신 할 일만 돌려줌(페이지가 확장으로 하고, 결과 문장을 답으로 보여 줌)
-            extra = {"browser_task": " ".join(mb.group(1).split())[:300] or " ".join(str(text).split())[:300]}
+        task = (" ".join(mb.group(1).split())[:300] or " ".join(str(text).split())[:300]) if mb else ""
+        if not task and force_browser:  # 브라우저로 하라고 했는데 모델이 표시를 안 씀 → 사용자 말(+앞 질문)로 할 일을 만듦
+            prev = [" ".join(str(h.content).split())[:150] for h in history if getattr(h, "role", "") == "user"][-2:]
+            task = ((("앞서 사용자가 물은 것: " + " / ".join(prev) + " → 지금 말: ") if prev else "") + " ".join(str(text).split()))[:300]
+        if task:  # 브라우저에서 할 일 → 답 대신 할 일만 돌려줌(페이지가 확장으로 하고, 결과 문장을 답으로 보여 줌)
+            extra = {"browser_task": task}
             mr = mem_job.result() if mem_job else None
             if mr is not None:
                 if mr["add"]:

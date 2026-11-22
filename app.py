@@ -360,6 +360,7 @@ class ChatIn(BaseModel):
     s: str = Field(default="", max_length=2000)  # 로그인 표 (주인 전용 모델 확인용, 2026-11-15)
     gd: str = Field(default="", max_length=4096)  # 주인 전용 모델을 쓸 때만: Google Drive 로그인 권한(서버가 주인인지 확인, 저장 안 함)
     rid: str = Field(default="", max_length=48)  # 이 질문의 번호 — 답을 만드는 중에 페이지를 닫아도 다시 열면 이어 받게 (2026-11-11)
+    browser_recent: bool = False  # 이 대화의 바로 앞 답이 브라우저 도구로 한 것 → 그 화면 얘기면 다시 브라우저로 (2026-11-22)
     browser: bool = False  # 사용자 브라우저에 '쿼리봇 브라우저 도구' 확장이 있음 → 필요하면 모델이 <<browser: 할 일>> (2026-11-22)
 
 
@@ -844,7 +845,8 @@ def _chat_core(body: ChatIn, request: Request):
                 raise HTTPException(status_code=403, detail="이 모델은 주인 계정으로 로그인했을 때만 쓸 수 있어요")
             args = dict(think=body.think, memory=body.memory, location=body.location.model_dump() if body.location else None,
                         style=body.style, instructions=body.instructions, older=[str(o)[:200] for o in body.older],
-                        browser=bool(body.browser) and body.model in (GEMMA_KEY, RUNPOD_KEY))  # 브라우저 도구는 Gemma만(행동 형식 학습)
+                        browser=bool(body.browser) and body.model in (GEMMA_KEY, RUNPOD_KEY),
+                        browser_recent=bool(body.browser_recent))  # 브라우저 도구는 Gemma만(행동 형식 학습)
             try:
                 if body.model == RUNPOD_KEY:
                     try:
