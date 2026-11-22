@@ -122,6 +122,9 @@ SMALL_TALK = re.compile(r"^\s*(안녕\S{0,4}|하이|헬로|ㅎㅇ|ㅎㅇㅎㅇ|�
                         r"hi|hello|hey|thanks?|thank you|ok(ay)?|good night|bye|ㅋ+|ㅎ+|ㅠ+|ㅜ+)[\s!.~?♡♥ㅎㅋㅠㅜ^]*$", re.I)
 
 
+AUTO_THINK = True  # 2026-11-22: '생각' 단추 없이 모델이 어려운 문제에서만 스스로 빠른 생각(<<생각>> 블록)
+
+
 def think_request(text: str):
     """(생각하기를 켤지, 사용자가 정한 생각 시간 초). '어떻게 생각해?'처럼 의견을 묻는 말은 켜지 않는다."""
     if not THINK_ASK.search(text) or THINK_OPINION.search(text):
@@ -828,6 +831,14 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
                    "3~8줄로 짧게 따져 봐(핵심 가정·계산·확인을 한 줄에 한 단계씩, 사용자가 쓴 언어로, 모두 합쳐 500자 안쪽). "
                    "그다음 <</생각>> 한 줄을 쓰고 이어서 사용자에게 보일 답을 써. 답에서는 생각 부분을 되풀이하지 말고 결론과 설명을 써. "
                    "도구(<<calc>>·<<search>>·<<weather>>)가 필요하면 <</생각>> 다음에 써. 몇 초 생각했는지 숫자는 지어내지 마.")
+    # 스스로 빠른 생각 (2026-11-22 사용자: "생각 알약까지 모델이 자동으로 판단하게") — 단추 없이, 따져 봐야 하는 문제일 때만 모델이 <<생각>> 블록을 씀
+    auto_think = AUTO_THINK and not fast and not think and not SMALL_TALK.match(text or "")
+    if auto_think:
+        system += (" 스스로 생각하기: 수학 풀이·논리 퍼즐·여러 단계 계산·코드 설계·조건이 많은 비교 판단처럼 따져 봐야 맞힐 수 있는 문제일 때만, "
+                   "답 맨 앞에 <<생각>> 한 줄을 쓰고 그 아래에 3~8줄로 짧게 따져 본 뒤(한 줄에 한 단계, 사용자가 쓴 언어로, 모두 합쳐 500자 안쪽) "
+                   "<</생각>> 한 줄을 쓰고 이어서 사용자에게 보일 답을 써. 답에서는 생각 부분을 되풀이하지 마. "
+                   "인사·잡담·짧은 사실 질문·간단한 설명·번역·글쓰기·짧은 코드처럼 바로 답할 수 있으면 <<생각>> 없이 바로 답해. "
+                   "도구(<<calc>>·<<search>>·<<weather>>·<<browser>>)가 필요하면 <</생각>> 다음에 써. 몇 초 생각했는지 숫자는 지어내지 마.")
     if think:
         system += (" 이번 답은 실제로 '생각하기' 기능을 켜고 만들어" + (f"지고, 사용자에게는 실제로 {secs}초 넘게 지난 뒤에 보여져" if secs else "져") +
                    ". 답하거나 도구(<<calc>>·<<search>>)를 쓰기 전에 반드시 속으로 따져 보는 생각 과정을 먼저 거쳐. "
@@ -872,7 +883,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
             return "", extra
     reasoning = (first.get("reasoning_content") or "").strip() if think else ""
     fast_note = ""
-    if fast:  # 빠른 생각: <<생각>> … <</생각>> 를 떼어 생각 요약으로
+    if fast or auto_think:  # 빠른 생각(단추 또는 모델이 스스로): <<생각>> … <</생각>> 를 떼어 생각 요약으로
         m = re.match(r"\s*" + THINK_OPEN + r"\s*(.*?)\s*" + THINK_CLOSE + r"\s*(.*)$", raw, re.S)
         if m:
             fast_note, raw = m.group(1).strip()[:1200], m.group(2)
@@ -967,7 +978,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
             extra["forget"] = mr["forget"]
     elif remember:
         extra["remember"] = remember
-    if fast:  # 빠른 생각: 풀이를 그대로 요약으로 (요약을 만드는 호출 한 번을 아낌)
+    if fast or (auto_think and fast_note):  # 빠른 생각: 풀이를 그대로 요약으로 (요약을 만드는 호출 한 번을 아낌)
         extra["thought"] = {"seconds": max(1, round(time.time() - t0)), "summary": clean(fast_note)[:800] if fast_note else "", "asked": 0}
         log(f"빠른 생각: {round(time.time() - t0)}초 (풀이 {len(fast_note)}자)")
     if think:
