@@ -131,6 +131,10 @@ FILE_PROMPT = (
     "짧은 예시 코드나 설명용 코드는 지금처럼 ```언어 로."
 )
 FILE_FENCE = re.compile(r"```\s*(file|파일)\s*[:：]", re.I)
+FILE_ASK = re.compile(r"파일|file|코드|스크립트|프로그램|소스|저장|다운로드|내려받|엑셀|스프레드시트|표로|문서로|웹\s?페이지|홈페이지|html|"
+                      r"\.(py|js|ts|jsx|tsx|html?|css|json|csv|tsv|txt|md|java|cpp|cc|c|h|cs|go|rs|rb|php|kt|swift|sh|bat|ps1|sql|xml|svg|ya?ml|toml|ini)\b|"
+                      r"\d+\s*줄", re.I)  # 이런 말이 있을 때만 파일 만들기 지시를 넣음 (2026-11-22 뉴런 아끼기)
+FILE_ANY = re.compile(r"```\s*(file|파일|gen|생성)\s*[:：]", re.I)
 FILE_HISTORY_CHARS = 8000  # 파일 블록이 든 앞 답은 이만큼까지 다시 넣음(이어서 고치기)
 
 
@@ -878,7 +882,10 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     else:
         wp = ""
     # 프롬프트 캐시(Groq·Cloudflare)는 앞부분이 똑같아야 맞는다 → 늘 같은 규칙(STATIC)을 앞에, 바뀌는 것(날짜·위치·기억·지침)은 뒤에
-    system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + FILE_PROMPT + REMEMBER_PROMPT
+    # 파일 만들기 지시는 파일 부탁일 때만 (2026-11-22 사용자: 뉴런이 너무 빨리 줄어 '줄여 줘') — 질문마다 약 900토큰 아낌
+    want_file = bool(FILE_ASK.search(text or "") or files or any(h.role == "assistant" and FILE_ANY.search(h.content) for h in history[-4:]))
+    system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + REMEMBER_PROMPT
+              + (FILE_PROMPT if want_file else "")
               + " ---- 이번 대화 정보: " + f"오늘은 한국 시각으로 {today_kst()}이야." + wp)
     if browser:
         system += BROWSER_PROMPT
