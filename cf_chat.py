@@ -339,6 +339,60 @@ def ready() -> bool:
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 _provider = contextvars.ContextVar("qb_provider", default="cf")
+# 실시간 답 (2026-11-22 사용자: 실시간 답 '1번') — app.py /chat/stream이 sink를 걸면, 답 본문을 쓰는 Cloudflare 호출(max_tokens를 따로 안 준 것)만
+# 글자가 나오는 대로 sink(지금까지 보일 글)로 알린다. 이어 쓰기는 _stream_base(앞에 쓴 글) 뒤에 붙여서. 생각하기(think)·제목·기억 고르기는 안 흘림
+_stream_sink = contextvars.ContextVar("qb_stream_sink", default=None)
+_stream_base = contextvars.ContextVar("qb_stream_base", default="")
+
+
+def _visible(s: str) -> str:
+    """흘려보낼 글: 생각 블록·도구 표시를 뺀, 지금까지 사용자에게 보일 부분"""
+    s = THINK_BLOCK.sub("", s or "")
+    m = re.search(THINK_OPEN, s)
+    if m:  # 아직 닫히지 않은 생각 블록 → 그 앞까지만
+        s = s[:m.start()]
+    s = re.sub(r"<think>.*?(?:</think>|$)", "", s, flags=re.S)
+    s = BROWSER_TAG.sub("", ANY_TAG.sub("", s))
+    s = re.sub(r"<<[^\n]*$", "", s)  # 쓰다 만 도구 표시
+    return s[:-1].strip() if s.endswith("<") else s.strip()
+
+
+def _read_stream(r, sink) -> dict:
+    """Cloudflare 실시간 응답(SSE)을 읽으며 sink에 보일 글을 알리고, 다 읽으면 보통 응답과 같은 모양으로 돌려줌"""
+    base, parts, fin, usage, last = _stream_base.get(), [], None, {}, 0.0
+    for raw in r:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            j = json.loads(data)
+        except ValueError:
+            continue
+        u = j.get("usage") or {}
+        if (u.get("total_tokens") or 0) > (usage.get("total_tokens") or 0):
+            usage = u
+        for ch in j.get("choices") or []:
+            piece = (ch.get("delta") or {}).get("content")
+            if piece:
+                parts.append(piece)
+            if ch.get("finish_reason"):
+                fin = ch["finish_reason"]
+        now = time.time()
+        if parts and now - last > 0.08:
+            last = now
+            try:
+                sink(_visible(base + "".join(parts)))
+            except Exception:  # noqa: BLE001 — 보여 주기 실패는 답에 영향 없게
+                pass
+    out = "".join(parts)
+    try:
+        sink(_visible(base + out))
+    except Exception:  # noqa: BLE001
+        pass
+    return {"choices": [{"message": {"role": "assistant", "content": out}, "finish_reason": fin or "stop"}], "usage": usage}
 
 
 def groq_ready() -> bool:
@@ -485,16 +539,18 @@ def _call(messages: list, think: bool = False, max_tokens: int = 0) -> dict:
     if _provider.get() == "runpod":
         return _call_runpod(messages, think, max_tokens)
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    sink = _stream_sink.get() if not think and not max_tokens else None  # 실시간 답: 답 본문 호출만 (2026-11-22)
     body = json.dumps({"model": CF_MODEL, "messages": messages, "temperature": TEMPERATURE,
                        "max_tokens": max_tokens or (THINK_MAX_TOKENS if think else MAX_TOKENS),
-                       "chat_template_kwargs": {"enable_thinking": think}}).encode("utf-8")
+                       "chat_template_kwargs": {"enable_thinking": think},
+                       **({"stream": True, "stream_options": {"include_usage": True}} if sink else {})}).encode("utf-8")
     # 아주 긴 글은 읽는 데도 시간이 걸린다 → 보내는 크기에 맞춰 기다리는 시간을 늘림 (최대 +120초)
     wait = (THINK_TIMEOUT if think else TIMEOUT) + min(120, len(body) // 5000)
     for attempt in range(3):  # Cloudflare 쪽 일시 오류(500 AiError 8005 등)는 1.5초·3초 뒤 두 번 더 (2026-11-09 PC·실서버에서 만남 → 사용자에게 '잠시 바빠요')
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "Authorization": "Bearer " + CF_API_TOKEN})
         try:
             with urllib.request.urlopen(req, timeout=wait) as r:
-                d = json.loads(r.read().decode("utf-8"))
+                d = _read_stream(r, sink) if sink else json.loads(r.read().decode("utf-8"))
             _add_usage(d.get("usage") or {})
             if _auth["ok"] is not True:
                 _set_auth(True)
@@ -746,7 +802,11 @@ def _finish(msgs: list, d: dict, out: str) -> str:
         in_file = _open_file_block(out)
         if in_file and "\n" in out and not out.endswith("\n"):
             out = out[:out.rfind("\n") + 1]  # 반쯤 쓴 마지막 줄은 버리고 다음 줄부터 새로
-        d = _call(msgs + [{"role": "assistant", "content": out}, {"role": "user", "content": CONTINUE_FILE_NOTE if in_file else CONTINUE_NOTE}])
+        btok = _stream_base.set(out)  # 실시간 답: 이어 쓴 글은 앞 글 뒤에 붙여 보여 줌
+        try:
+            d = _call(msgs + [{"role": "assistant", "content": out}, {"role": "user", "content": CONTINUE_FILE_NOTE if in_file else CONTINUE_NOTE}])
+        finally:
+            _stream_base.reset(btok)
         more = clean(d["choices"][0]["message"]["content"] or "")
         fin = d["choices"][0].get("finish_reason") or ""
         if in_file:

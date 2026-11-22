@@ -32,7 +32,7 @@ import sentencepiece as spm
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from np_model import NPModel
@@ -756,6 +756,48 @@ def chat(body: ChatIn, request: Request):
     if rid:
         _result_put(rid, out)
     return out
+
+
+# ---------------------------------------------------------
+# 실시간 답 (2026-11-22 사용자: 실시간 답 '1번') — /chat과 같은 일을 다른 스레드에서 하면서, 모델이 쓰는 글을 0.1초마다 흘려보냄(SSE)
+#  data: {"t": 지금까지 보일 글} 여러 번 → data: {"final": /chat과 같은 답} 또는 {"error": 상태 번호, "detail": 글}
+#  15초마다 ': ping'(중간 장치가 조용한 연결을 끊지 않게). 페이지는 이 통로가 없으면(옛 서버) /chat으로
+# ---------------------------------------------------------
+@app.post("/chat/stream")
+def chat_stream(body: ChatIn, request: Request):
+    state = {"t": None, "done": None}
+
+    def sink(txt):
+        state["t"] = txt
+
+    def work():
+        cf_chat._stream_sink.set(sink)  # 이 스레드에서 부르는 답 본문 호출만 흘림
+        try:
+            res = {"final": chat(body, request)}
+        except HTTPException as e:
+            res = {"error": e.status_code, "detail": e.detail if isinstance(e.detail, str) else ""}
+        except Exception:  # noqa: BLE001
+            res = {"error": 500, "detail": ""}
+        state["done"] = res
+
+    threading.Thread(target=work, daemon=True).start()
+
+    def gen():
+        sent, ping = None, time.time()
+        while True:
+            t, done = state["t"], state["done"]
+            if t is not None and t != sent:
+                sent = t
+                yield "data: " + json.dumps({"t": t}, ensure_ascii=False) + "\n\n"
+            if done is not None:
+                yield "data: " + json.dumps(done, ensure_ascii=False) + "\n\n"
+                return
+            if time.time() - ping > 15:
+                ping = time.time()
+                yield ": ping\n\n"
+            time.sleep(0.1)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 def _chat_core(body: ChatIn, request: Request):
