@@ -351,7 +351,7 @@ class ChatIn(BaseModel):
     files: list[FileIn] = Field(default_factory=list, max_length=5)
     # 쿼리봇 자아 (2026-11-09): '깊게 생각' 단추, 이 브라우저에 저장된 사용자 기억(한 줄씩, Gemma 4만 씀)
     think: bool = False
-    memory: list[str] = Field(default_factory=list, max_length=12)
+    memory: list[str] = Field(default_factory=list, max_length=30)  # 12 → 30줄 (2026-11-22 자동 기억)
     # 위치 공유 (2026-11-09): 페이지의 '위치' 단추를 켰을 때만, 대략 좌표(소수 둘째 자리). 저장·로그 안 함
     location: LocIn | None = None
     style: str = Field(default="", max_length=20)          # 설정 > 사용자 지침 > 말투 (Gemma 4만)
@@ -858,8 +858,8 @@ def _chat_core(body: ChatIn, request: Request):
         kind += f" [검색 {len(extra.get('sources', []))}건]"  # 검색어는 방문자가 쓴 말이라 로그에 남기지 않는다
     if extra and extra.get("thought"):
         kind += f" [생각 {extra['thought']['seconds']}초]"
-    if extra and extra.get("remember"):
-        kind += f" [기억 {len(extra['remember'])}줄]"  # 기억 내용은 남기지 않는다
+    if extra and (extra.get("remember") or extra.get("forget")):
+        kind += f" [기억 +{len(extra.get('remember') or [])} −{len(extra.get('forget') or [])}]"  # 기억 내용은 남기지 않는다
     if body.location:
         kind += " [위치]"  # 좌표·동네 이름은 남기지 않는다
     if extra and extra.get("fallback"):
@@ -879,6 +879,8 @@ def _chat_core(body: ChatIn, request: Request):
             out["thought"] = extra["thought"]  # {seconds, summary(한국어 요약), asked(사용자가 정한 초)}
         if extra.get("remember"):
             out["remember"] = extra["remember"]  # 페이지가 이 브라우저에 저장할 새 기억
+        if extra.get("forget"):
+            out["forget"] = extra["forget"]  # 페이지가 지울 기억(취향이 바뀌었거나 잊으라고 함, 2026-11-22)
         if extra.get("fallback"):
             out["fallback"] = extra["fallback"]  # Gemma 4 대신 기본 모델이 답함 (AuthError·QuotaError·Busy)
         if extra.get("ask_location"):
