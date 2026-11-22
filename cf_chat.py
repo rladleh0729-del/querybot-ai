@@ -144,6 +144,35 @@ FILE_FENCE = re.compile(r"```\s*(file|파일)\s*[:：]", re.I)
 FILE_ASK = re.compile(r"파일|file|코드|스크립트|프로그램|소스|저장|다운로드|내려받|엑셀|스프레드시트|표로|문서로|웹\s?페이지|홈페이지|html|"
                       r"\.(py|js|ts|jsx|tsx|html?|css|json|csv|tsv|txt|md|java|cpp|cc|c|h|cs|go|rs|rb|php|kt|swift|sh|bat|ps1|sql|xml|svg|ya?ml|toml|ini)\b|"
                       r"\d+\s*줄", re.I)  # 이런 말이 있을 때만 파일 만들기 지시를 넣음 (2026-11-22 뉴런 아끼기)
+QUIZ_ASK = re.compile(r"퀴즈|quiz|문제(?:를|좀|\s|\d|개|하나|두|세|몇)*(?:내|출제|줘|주세요|줄래)|풀어\s?(볼|보고|봐도|봐야)|연습\s?문제|맞혀\s?(볼|보|봐)|맞춰\s?(볼|보|봐)|"
+                      r"테스트\s?해|시험\s?(문제|봐|쳐)", re.I)  # 이런 말이 있을 때만 퀴즈 지시를 넣음 (2026-11-22)
+LATEX_CMD = re.compile(r"(?<!\\)\\(?=(?:d?frac|times|div|sqrt|cdot|cdots|ldots|dots|left|right|pm|mp|le|leq|ge|geq|neq|approx|infty|int|sum|prod|lim|log|ln|sin|cos|tan|"
+                       r"alpha|beta|gamma|theta|pi|sigma|omega|text|mathrm|quad|binom|vec|overline|angle|triangle|circ|to|rightarrow|Rightarrow|cup|cap|in|subset)\b)")
+QUIZ_BLOCK = re.compile(r"```\s*(?:quiz|퀴즈)\s*\n([\s\S]*?)```", re.I)
+
+
+def _fix_quiz(out: str) -> str:
+    """퀴즈 블록의 JSON을 고쳐 다시 씀: LaTeX 역슬래시가 JSON 특수 문자(\f·\t…)로 읽히지 않게 (2026-11-22)"""
+    def one(m):
+        raw = LATEX_CMD.sub(r"\\\\", m.group(1).strip())
+        try:
+            d = json.loads(raw, strict=False)
+        except ValueError:
+            return m.group(0)
+        return "```quiz\n" + json.dumps(d, ensure_ascii=False) + "\n```"
+    return QUIZ_BLOCK.sub(one, out)
+
+
+QUIZ_PROMPT = (
+    " 퀴즈: 사용자가 문제를 내 달라고 하거나 직접 풀어 보겠다고 하면, 문제마다 ```quiz 한 줄로 시작해 JSON 하나를 쓰고 ``` 로 닫아 "
+    "(화면에서 보기를 누르거나 답을 넣으면 바로 채점되는 카드가 되고, 정답은 숨겨져). "
+    '객관식: {"q": "문제(수식은 $...$)", "choices": ["보기1", "보기2", "보기3", "보기4", "보기5"], "answer": 정답 보기 번호(1부터)} — 보기 앞에 ①·1. 같은 번호는 붙이지 마. '
+    '단답형: {"q": "문제", "answer": "정답", "accept": ["같은 뜻으로 맞게 쳐 줄 다른 답"]}. '
+    "블록 밖에는 정답·풀이를 쓰지 말고 '풀어 보세요' 같은 짧은 말만. 여러 문제면 블록을 여러 개. "
+    "쿼리봇 자료(평가원 기출)를 문제로 낼 땐 그 문제·보기를 그대로 쓰고 answer는 공식 정답 번호로. "
+    "직접 만든 문제는 반드시 답 맨 앞의 <<생각>> … <</생각>> 안에서 문제를 끝까지 풀어 정답을 확인한 뒤, 그 계산 결과를 answer에 써(짐작으로 정답을 쓰지 마). "
+    "사용자가 답을 맞혔는지 묻거나 풀이를 달라고 하면 그때 설명해."
+)
 FILE_ANY = re.compile(r"```\s*(file|파일|gen|생성)\s*[:：]", re.I)
 FILE_HISTORY_CHARS = 8000  # 파일 블록이 든 앞 답은 이만큼까지 다시 넣음(이어서 고치기)
 
@@ -896,6 +925,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     want_file = bool(FILE_ASK.search(text or "") or files or any(h.role == "assistant" and FILE_ANY.search(h.content) for h in history[-4:]))
     system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + REMEMBER_PROMPT
               + (FILE_PROMPT if want_file else "")
+              + (QUIZ_PROMPT if QUIZ_ASK.search(text or "") else "")  # 퀴즈 지시도 부탁할 때만 (2026-11-22)
               + " ---- 이번 대화 정보: " + f"오늘은 한국 시각으로 {today_kst()}이야." + wp)
     force_browser = bool(browser and BROWSER_FORCE.search(text or ""))
     if browser:
@@ -948,6 +978,8 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     # 빠른 생각 (2026-11-11 사용자: "생각만 1분은 좀 길어. 고작 26b인데") — Gemma의 생각 기능은 짧게 하라고 해도 한도(2,400~4,000토큰)를 다 써서
     # Cloudflare 속도(초당 26~46토큰)로 50~120초가 걸림 → '생각' 단추는 답 앞에 3~8줄 풀이를 먼저 쓰게 하고(보통 +3~8초), 그 풀이를 '생각 요약'으로 보여 준다.
     # "생각해 봐", "30초 동안 생각해" 처럼 직접 부탁하면 예전처럼 진짜 생각 기능.
+    if QUIZ_ASK.search(text or "") and not think:  # 퀴즈: 먼저 풀어 정답을 확인하게 '빠른 생각'을 켬 (짐작으로 정답을 써서 틀렸음, 2026-11-22)
+        think = True
     fast = think and not asked  # Groq도 빠른 생각: 호출 한 번·같은 설정이라 캐시가 맞아 무료 한도를 덜 씀 (2026-11-11 실서버: 진짜 생각+요약은 호출 2번·캐시 0)
     if fast:
         think = False
@@ -1109,6 +1141,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     out = THINK_BLOCK.sub("", out).strip()
     remember = [" ".join(m.split())[:150] for m in REMEMBER_TAG.findall(out)][:2]
     out = ANY_TAG.sub("", out).strip()  # 혹시 남은 도구 표시는 지움
+    out = _fix_quiz(out)
     # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움) — 사용자가 그 글자(일본어·중국어·러시아어 등)로 쓴 경우는 그대로 둔다
     if not _foreign_ok(text, history) and _has_stray(out):
         out = _strip_stray(ANY_TAG.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or ""))).strip()
