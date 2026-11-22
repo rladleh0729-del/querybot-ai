@@ -110,6 +110,21 @@ BROWSER_PROMPT = (
     "그러면 브라우저 도구가 그 일을 하고 결과를 사용자에게 보여 줘. 그냥 지식 질문·대화·글쓰기는 평소처럼 답하고, "
     "어떤 사이트에서 하라는 말 없이 정보만 필요한 질문은 지금처럼 <<search>>를 써."
 )
+# 파일 만들기 (2026-11-22 사용자: "코드, 다른 텍스트 같은 파일들을 AI가 만들 수 있는 기능") — 페이지가 ```file:이름 블록을 받기 카드로 그림
+FILE_PROMPT = (
+    " 파일 만들기: 사용자가 파일로 달라고 하거나(코드 파일·문서·표·설정 파일·웹페이지 등) 저장해서 바로 쓸 완성된 결과물을 원하면, "
+    "파일마다 ```file:파일이름.확장자 한 줄로 시작해 전체 내용을 빠짐없이 쓰고 ``` 로 닫아(화면에서 받기 단추가 붙은 파일 카드가 됨). "
+    "파일 이름은 무엇인지 알 수 있게 짧게 짓고 한국어·띄어쓰기도 돼(예: 러시아워 문제 제작기.py), 확장자는 내용에 맞게. "
+    "다만 다른 파일이 불러 쓰는 파일(import 하는 모듈, html이 불러오는 css·js)은 영어·숫자·밑줄로. 엑셀 표는 .csv, 워드·한글 문서는 .md나 .html, 그림은 .svg로 만들어 "
+    "(.xlsx·.docx·.png 같은 바이너리 파일은 못 만드니 그렇게 바꿔 만든다고 한 줄로 알려). 여러 파일이면 블록을 여러 개 쓰고, 블록 밖에는 짧은 설명만. "
+    "파일 안에 ```가 들어가야 하면 대신 ~~~를 써. 앞 답의 파일을 고쳐 달라고 하면 고친 파일 전체를 같은 이름으로 다시 줘. "
+    "받은 .csv에는 엑셀에서 한글이 안 깨지게 BOM이 붙으니, csv를 읽는 코드를 만들 땐 encoding='utf-8-sig'로 열어. "
+    "짧은 예시 코드나 설명용 코드는 지금처럼 ```언어 로."
+)
+FILE_FENCE = re.compile(r"```\s*(file|파일)\s*[:：]", re.I)
+FILE_HISTORY_CHARS = 8000  # 파일 블록이 든 앞 답은 이만큼까지 다시 넣음(이어서 고치기)
+
+
 MAX_MEMORY = 30
 REMEMBER_PROMPT = (
     " 사용자가 알려 준 이름·취향·하는 일과 네 답에 대한 지적은 시스템이 따로 골라 자동으로 기억에 저장해(저장되면 답 아래에 표시됨). "
@@ -776,7 +791,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     else:
         wp = ""
     # 프롬프트 캐시(Groq·Cloudflare)는 앞부분이 똑같아야 맞는다 → 늘 같은 규칙(STATIC)을 앞에, 바뀌는 것(날짜·위치·기억·지침)은 뒤에
-    system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + REMEMBER_PROMPT
+    system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + FILE_PROMPT + REMEMBER_PROMPT
               + " ---- 이번 대화 정보: " + f"오늘은 한국 시각으로 {today_kst()}이야." + wp)
     if browser:
         system += BROWSER_PROMPT
@@ -850,7 +865,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
                    "생각할 주제를 따로 주지 않았으면 지금까지의 대화나 네가 궁금한 것을 골라 생각하고, 무엇을 생각했는지 짧게 들려줘. 몇 초 생각했는지 숫자는 지어내지 마.")
     msgs = [{"role": "system", "content": system}]
     for h in history[-HISTORY_TURNS:]:
-        msgs.append({"role": h.role, "content": h.content[:HISTORY_CHARS]})
+        msgs.append({"role": h.role, "content": h.content[:FILE_HISTORY_CHARS if FILE_FENCE.search(h.content) else HISTORY_CHARS]})
     # 규칙은 사용자 말 바로 뒤에도 한 번 더 붙임: 지시문에만 두면 '세 문장 이내' 같은 규칙이 기본 길이 안내에 밀려 6번 중 1번만 지켜짐(2026-11-22 시험)
     rule_note = ("\n\n(내가 전에 정해 둔 규칙이야. 질문이 무엇이든 이번 답도 반드시 지키고, 규칙 얘기는 꺼내지 마: "
                  + " ".join(f"({i + 1}) {r}" for i, r in enumerate(rules)) + ")") if rules else ""
@@ -999,7 +1014,7 @@ def reply_old_wiki(text: str, history: list):
     ctx = wiki_context(text)
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in history[-HISTORY_TURNS:]:
-        msgs.append({"role": h.role, "content": h.content[:HISTORY_CHARS]})
+        msgs.append({"role": h.role, "content": h.content[:FILE_HISTORY_CHARS if FILE_FENCE.search(h.content) else HISTORY_CHARS]})
     if ctx:
         # 괄호 안(생몰년·높이 같은 숫자)을 지우면 답이 사라진다 → wiki_search._clean은 쓰지 않고 공백만 정리
         # (2026-11-08 사용자: "위키백과 돌려서 오히려 멍청하다") → 자료는 참고만, 관련 없으면 무시하고 아는 대로. 숫자·날짜만 조심.
