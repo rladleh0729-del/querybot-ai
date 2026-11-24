@@ -57,8 +57,13 @@ def ready() -> bool:
 
 
 def _get(url: str, timeout: int = 20) -> bytes:
-    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
-        return r.read()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:  # 공공데이터포털은 열쇠 오류를 403 + 본문(등록되지 않은 서비스키 등)으로 줌 → 이유를 남김
+        body = e.read().decode("utf-8", "replace")
+        m = re.search(r'"?errMsg"?\s*[:>]\s*"?([A-Z_]+)', body)
+        raise RuntimeError(f"HTTP {e.code} {m.group(1) if m else body[:60]}") from None
 
 
 def _dart(path: str, **params) -> dict:
@@ -241,17 +246,22 @@ def _amt(r, k):
     return int(v) if re.fullmatch(r"-?\d+", v) else None
 
 
-def _section(xml: str, title_pat: str, cap: int) -> str:
-    m = re.search(r"<TITLE[^>]*>\s*[\dⅠⅡⅢⅣⅤⅥⅦ.\s]*" + title_pat + r"[^<]*</TITLE>", xml)
+def _section(xml: str, title_pat: str, cap: int, focus: str = "") -> str:
+    """보고서 원문에서 제목이 title_pat인 절의 글. focus가 있으면 그 말(예: 산업의 특성·성장성)이 처음 나오는 곳부터"""
+    # '1. 사업의 개요'뿐 아니라 업종이 둘인 회사는 '1. (제조서비스업)사업의 개요'처럼 괄호가 붙음(카카오)
+    m = re.search(r"<TITLE[^>]*>\s*[\dⅠⅡⅢⅣⅤⅥⅦ.\s]*(?:\([^)<]{0,15}\)\s*)?" + title_pat + r"[^<]*</TITLE>", xml)
     if not m:
         return ""
     end = xml.find("<TITLE", m.end())
-    chunk = xml[m.end(): end if end > 0 else m.end() + 200000][:200000]
+    chunk = xml[m.end(): end if end > 0 else m.end() + 800000][:800000]
     chunk = re.sub(r"<(TABLE|TABLE-GROUP)\b.*?</\1>", " (표 생략) ", chunk, flags=re.S)
     t = html.unescape(re.sub(r"<[^>]+>", " ", chunk))
     t = re.sub(r"[ \t　\xa0]+", " ", t)
     t = re.sub(r"\s*\n\s*", "\n", t).strip()
     t = re.sub(r"(\s*\(표 생략\)\s*)+", " (표 생략) ", t)
+    if focus:
+        f = re.search(focus, t)
+        t = t[max(0, f.start() - 40):] if f else t
     return (t[:cap] + "…") if len(t) > cap else t
 
 
@@ -261,7 +271,9 @@ def _overview(rcept_no: str) -> dict:
     names = sorted(z.namelist(), key=lambda n: (not n.startswith(rcept_no), -z.getinfo(n).file_size))
     xml = z.read(names[0]).decode("utf-8", "replace")
     del raw, z
-    return {"overview": _section(xml, r"사업의\s*개요", 2200), "etc": _section(xml, r"기타\s*참고\s*사항", 1300)}
+    # 기타 참고사항은 특허·환경 규제부터 나오는 회사가 많아(삼성전자) 산업의 특성·성장성·시장 여건 부분부터
+    return {"overview": _section(xml, r"사업의\s*개요", 2200),
+            "etc": _section(xml, r"기타\s*참고\s*사항", 1500, r"산업의\s*특성|성장성|시장\s*여건|시장의\s*특성|경기\s*변동|경쟁\s*요소|산업\s*현황")}
 
 
 def company(name: str):
@@ -278,7 +290,7 @@ def company(name: str):
                      end_de=today.strftime("%Y%m%d"), pblntf_ty="A", page_count=20).get("list") or []
         reps = [r for r in reps if re.search(r"(사업|반기|분기)보고서", r.get("report_nm", "")) and "기재정정" not in r.get("rm", "")]
         recent = _dart("list.json", corp_code=cc, bgn_de=(today - timedelta(days=90)).strftime("%Y%m%d"),
-                       end_de=today.strftime("%Y%m%d"), page_count=8).get("list") or []
+                       end_de=today.strftime("%Y%m%d"), page_count=20).get("list") or []
         annual = next((r for r in reps if "사업보고서" in r["report_nm"]), None)
         latest = reps[0] if reps else None
         fin_a = fin_q = None
@@ -335,7 +347,13 @@ def company(name: str):
     if ov.get("etc"):
         lines.append(f"\n기타 참고사항(산업·시장 여건 등, 원문 일부):\n{ov['etc']}")
     if recent:
-        lines.append("\n최근 90일 공시: " + "; ".join(f"{_day(r['rcept_dt'])} {r['report_nm'].strip()}" for r in recent[:8]))
+        seen, uniq = set(), []
+        for r in recent:  # 같은 날 같은 이름의 공시(계열사 거래 변경 여러 건 등)는 한 번만
+            k = (r["rcept_dt"], r["report_nm"].strip())
+            if k not in seen:
+                seen.add(k)
+                uniq.append(f"{_day(r['rcept_dt'])} {r['report_nm'].strip()}")
+        lines.append("\n최근 90일 공시: " + "; ".join(uniq[:8]))
     src = []
     if latest:
         src.append({"title": f"{corp_name} {latest['report_nm'].strip()} (DART)", "url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={latest['rcept_no']}"})
