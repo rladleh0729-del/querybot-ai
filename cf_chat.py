@@ -21,7 +21,8 @@ import calc_tool
 import weather
 import web_search
 import wiki_search
-import kb  # 지식 창고: 평가원 수능 수학 기출 (2026-11-22)
+import kb  # 지식 창고: 평가원 수능 기출 (2026-11-22, 2026-11-24 전 영역)
+import finance  # 기업·주가 도구: 금융감독원 DART + 금융위원회 주식시세 (2026-11-24)
 
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
@@ -83,7 +84,19 @@ SEARCH_TAG = re.compile(r"<<\s*search\s*:\s*(.+?)\s*>>", re.S | re.I)
 THINK_OPEN = r"<<\s*[^<>/:\n]{1,8}\s*>>"
 THINK_CLOSE = r"<<\s*/\s*[^<>:\n]{0,8}\s*>>"
 THINK_BLOCK = re.compile(THINK_OPEN + r"\s*(.*?)\s*" + THINK_CLOSE, re.S)  # 2026-11-11: 모델이 <<생약>>처럼 틀리게 쓰기도 함
-ANY_TAG = re.compile(r"<<\s*(calc|search|remember|weather)\s*:.*?>>", re.S | re.I)
+ANY_TAG = re.compile(r"<<\s*(calc|search|remember|weather|stock|company)\s*:.*?>>", re.S | re.I)
+# 기업·주가 도구 (2026-11-24 사용자: "실시간 주가 조회랑 조언용 주식 데이터" → "DART·전일 주가부터"): 열쇠(DART_API_KEY·DATA_GO_KR_KEY)가 있고
+# 주식·회사 얘기일 때만 안내(뉴런 아끼기). 모델이 <<stock: 이름>>·<<company: 이름>>을 쓰면 finance.tool이 자료 글을 돌려줌
+STOCK_TAG = re.compile(r"<<\s*stock\s*:\s*(.+?)\s*>>", re.S | re.I)
+COMPANY_TAG = re.compile(r"<<\s*company\s*:\s*(.+?)\s*>>", re.S | re.I)
+FIN_ASK = re.compile(r"주가|주식|종목|시가\s?총액|시총|상장|코스피|코스닥|증시|실적|매출|영업\s?이익|순이익|재무|공시|사업\s?보고서|배당|PER|PBR|"
+                     r"투자|매수|매도|전망|성장\s?(성|가능성)|기업|회사|주주|분기|반도체주|\d{6}", re.I)
+FIN_PROMPT = (
+    " (주식·기업 도구) 한국 상장사의 주가·시가총액·등락은 검색 말고 <<stock: 회사 이름>>(마지막 거래일 종가, 실시간 아님). "
+    "한국 상장사의 사업 내용·방향·성장 가능성·실적·재무·공시를 묻거나 투자 판단을 물으면 <<company: 회사 이름>>(금융감독원 DART 공시와 주가). "
+    "여러 회사를 비교하면 쉼표로(<<stock: 삼성전자, SK하이닉스>>). 해외 주식·비상장 회사·최근 뉴스는 <<search>>."
+)
+UNDERLINE = re.compile(r"<u\b[^>]*>(.*?)</u>", re.S | re.I)  # 사이트는 답 속 HTML을 글자 그대로 보여 줌 → 밑줄은 굵은 글씨로
 # 날씨 도구 (2026-11-09): 웹 검색으로 날씨를 찾으면 맛집·PDF가 걸려서, 날씨는 weather.py(OpenStreetMap 지명 + Open-Meteo 예보)로
 WEATHER_PROMPT = (
     " 날씨는 검색 말고 <<weather: 지역>>(예: <<weather: 서울 서초구>>). 지역이 없으면: 위치를 알면 <<weather: 내 위치>>, 앞 대화에 지역이 있으면 그 지역, "
@@ -923,7 +936,9 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     # 프롬프트 캐시(Groq·Cloudflare)는 앞부분이 똑같아야 맞는다 → 늘 같은 규칙(STATIC)을 앞에, 바뀌는 것(날짜·위치·기억·지침)은 뒤에
     # 파일 만들기 지시는 파일 부탁일 때만 (2026-11-22 사용자: 뉴런이 너무 빨리 줄어 '줄여 줘') — 질문마다 약 900토큰 아낌
     want_file = bool(FILE_ASK.search(text or "") or files or any(h.role == "assistant" and FILE_ANY.search(h.content) for h in history[-4:]))
+    want_fin = finance.ready() and bool(FIN_ASK.search(text or "") or any(FIN_ASK.search(h.content[:300]) for h in history[-2:] if h.role == "user"))
     system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + REMEMBER_PROMPT
+              + (FIN_PROMPT if want_fin else "")
               + (FILE_PROMPT if want_file else "")
               + (QUIZ_PROMPT if QUIZ_ASK.search(text or "") else "")  # 퀴즈 지시도 부탁할 때만 (2026-11-22)
               + " ---- 이번 대화 정보: " + f"오늘은 한국 시각으로 {today_kst()}이야." + wp)
@@ -1084,14 +1099,22 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
                  {"role": "user", "content": "방금 생각한 것을 바탕으로 원래 말에 답해 줘. 생각 요약을 그대로 옮기지 말고, 원래 말에 대한 답을 해."}]
         d = _call(msgs)
         out = _finish(msgs, d, clean(d["choices"][0]["message"]["content"] or ""))
-    extra, calcs, searched, weathered = {}, 0, False, False
+    extra, calcs, searched, weathered, fins = {}, 0, False, False, 0
     if kb_hits:
         extra["sources"] = kb.sources(kb_hits)
-    for _ in range(4):  # 도구는 한 질문에 날씨 1번 + 검색 1번 + 계산 2번까지
+    for _ in range(5):  # 도구는 한 질문에 날씨 1번 + 검색 1번 + 계산 2번 + 기업·주가 1번까지
+        mf = (COMPANY_TAG.search(out) or STOCK_TAG.search(out)) if fins < 1 and finance.ready() else None
         mw = WEATHER_TAG.search(out) if not weathered else None
         ms = SEARCH_TAG.search(out) if USE_SEARCH and not searched else None
         mc = CALC_TAG.search(out) if USE_CALC and calcs < 2 else None
-        if mw:
+        if mf:
+            fins += 1
+            kind = "company" if mf.re is COMPANY_TAG else "stock"
+            note, src = finance.tool(kind, mf.group(1).strip()[:80])
+            if src:
+                extra.setdefault("sources", []).extend(src)
+            msgs += [{"role": "assistant", "content": mf.group(0)}, {"role": "user", "content": note}]
+        elif mw:
             weathered = True
             place = mw.group(1).strip()[:60]
             if MY_PLACE.match(place):
@@ -1143,6 +1166,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     out = THINK_BLOCK.sub("", out).strip()
     remember = [" ".join(m.split())[:150] for m in REMEMBER_TAG.findall(out)][:2]
     out = ANY_TAG.sub("", out).strip()  # 혹시 남은 도구 표시는 지움
+    out = UNDERLINE.sub(lambda m: "**" + m.group(1).strip() + "**", out)
     out = _fix_quiz(out)
     # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움) — 사용자가 그 글자(일본어·중국어·러시아어 등)로 쓴 경우는 그대로 둔다
     if not _foreign_ok(text, history) and _has_stray(out):
