@@ -936,7 +936,9 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
             system += BROWSER_FORCE_NOTE
     if USAGE_Q.search(text or ""):
         u = usage()
-        system += (f" 오늘 남은 무료 사용량: 뉴런 {u['left']:,}개 / 하루 {u['limit']:,}개({round(100 * u['left'] / u['limit'])}% 남음). "
+        pc = max(0.0, min(100.0, 100 * u['left'] / (u['limit'] or 10000)))  # 2026-11-24 사용자: '그냥 %로 나타내. 뉴런 빼'
+        pc = round(pc) if pc >= 10 else round(pc, 1)
+        system += (f" 오늘 남은 무료 사용량: {pc}% (하루 100%). 뉴런 같은 단위나 개수는 말하지 말고 %로만 답해. "
                    "이 양은 쿼리봇을 쓰는 모든 사람이 함께 쓰고, 매일 한국 시각 오전 9시에 다시 채워져. 한 사람은 1분에 최대 20번까지 보낼 수 있어. "
                    "사용자가 사용량·남은 양·한도를 물으면 이 숫자로 짧게 답해. 설정의 '사용량'에서도 볼 수 있어.")
     if older:  # 앞 대화 8개보다 오래된 부분: 사용자가 했던 말을 짧게 (2026-11-11 '오래된 대화는 요약해서')
