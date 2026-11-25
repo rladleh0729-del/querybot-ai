@@ -23,7 +23,8 @@ from datetime import datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
 DART = "https://opendart.fss.or.kr/api/"
-PRICE_URL = "https://apis.data.go.kr/1160100/service/GetStockSecuritiesInfoService/getStockPriceInfo"
+# 2026-11-25: 옛 주소(/service/GetStockSecuritiesInfoService/getStockPriceInfo)는 새로 받은 열쇠를 '등록되지 않은 서비스키'로 막음 → V2 주소
+PRICE_URL = "https://apis.data.go.kr/1160100/GetStockSecuritiesInfoService_V2/getStockPriceInfo_V2"
 PRICE_SRC = "https://www.data.go.kr/data/15094808/openapi.do"
 UA = {"User-Agent": "Mozilla/5.0 (querybot)"}
 _lock = threading.Lock()
@@ -165,6 +166,8 @@ def _price_rows(code: str = "", like_name: str = "", days: int = 400) -> list:
     items = (body.get("items") or {}).get("item") or []
     if isinstance(items, dict):
         items = [items]
+    if code:  # likeSrtnCd는 '들어 있는' 종목도 걸러 오므로 같은 코드만
+        items = [it for it in items if it.get("srtnCd", "")[-6:] == code]
     if like_name and items:  # 이름이 비슷한 여러 종목 → 정확히 같은 이름, 아니면 시가총액이 가장 큰 종목
         last = max(it["basDt"] for it in items)
         today = [it for it in items if it["basDt"] == last]
