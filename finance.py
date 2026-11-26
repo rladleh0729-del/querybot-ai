@@ -223,6 +223,60 @@ def price(name: str):
     return s, [{"title": f"{t['itmsNm']} 주가 {_day(t['basDt'])} (금융위원회·공공데이터포털)", "url": PRICE_SRC}]
 
 
+def _all_rows(basdt: str) -> list:
+    """그날 전 종목 시세(1,000개씩 여러 쪽)"""
+    out, page = [], 1
+    while page <= 6:
+        p = {"serviceKey": _key("DATA_GO_KR_KEY"), "resultType": "json", "numOfRows": 1000, "pageNo": page, "basDt": basdt}
+        raw = _get(PRICE_URL + "?" + urllib.parse.urlencode(p), timeout=40).decode("utf-8", "replace")
+        if not raw.lstrip().startswith("{"):
+            m = re.search(r"<returnAuthMsg>(.*?)</returnAuthMsg>|<resultMsg>(.*?)</resultMsg>", raw)
+            raise RuntimeError("주가 API " + ((m.group(1) or m.group(2)) if m else raw[:60]))
+        body = json.loads(raw).get("response", {}).get("body", {})
+        items = (body.get("items") or {}).get("item") or []
+        if isinstance(items, dict):
+            items = [items]
+        out += items
+        if not items or len(out) >= int(body.get("totalCount") or 0):
+            break
+        page += 1
+    return out
+
+
+def movers(top: int = 8, universe: int = 200):
+    """(글, 출처) — 마지막 거래일에 시가총액 상위 회사 중 많이 오른·내린 곳 (2026-11-26 사용자: '많이 올라가거나 떨어진 주요 회사들 정리')"""
+    def go():
+        rows = _price_rows(code="005930", days=12)  # 마지막 거래일 알아내기(삼성전자 시세의 가장 최근 날)
+        if not rows:
+            return None
+        last = rows[0]["basDt"]
+        return last, _all_rows(last)
+    got = _cached("market", 1800, go)
+    if not got or not got[1]:
+        return "마지막 거래일 시세를 가져오지 못했어. 지금은 확인할 수 없다고 말해.", []
+    last, items = got
+
+    def num(it, k, cast=int):
+        try:
+            return cast(str(it.get(k) or 0).replace(",", ""))
+        except ValueError:
+            return cast(0)
+    items = [it for it in items if it.get("mrktCtg") in ("KOSPI", "KOSDAQ") and num(it, "mrktTotAmt") > 0]
+    big = sorted(items, key=lambda it: num(it, "mrktTotAmt"), reverse=True)[:universe]
+    up = sorted(big, key=lambda it: num(it, "fltRt", float), reverse=True)[:top]
+    dn = sorted(big, key=lambda it: num(it, "fltRt", float))[:top]
+    ups = sum(1 for it in items if num(it, "fltRt", float) > 0)
+    dns = sum(1 for it in items if num(it, "fltRt", float) < 0)
+
+    def line(it):
+        return (f"- {it['itmsNm']}({it['mrktCtg']}) {num(it, 'fltRt', float):+.2f}% · 종가 {num(it, 'clpr'):,}원"
+                f"(전일 대비 {num(it, 'vs'):+,}원) · 시가총액 {_won(it['mrktTotAmt'])} · 거래대금 {_won(it['trPrc'])}")
+    s = (f"[등락 · {_day(last)} 종가 기준 — 실시간 아님, 시가총액 상위 {len(big)}개 회사 중]\n"
+         f"코스피·코스닥 {len(items):,}종목 중 오름 {ups:,} · 내림 {dns:,}\n"
+         "많이 오른 회사:\n" + "\n".join(line(it) for it in up) + "\n많이 내린 회사:\n" + "\n".join(line(it) for it in dn))
+    return s, [{"title": f"주식시세 {_day(last)} (금융위원회·공공데이터포털)", "url": PRICE_SRC}]
+
+
 # ---------- DART 회사 정보 ----------
 REPRT = {"03": "11013", "06": "11012", "09": "11014", "12": "11011"}
 ACCTS = [("매출액", r"^(매출액|수익\(매출액\)|영업수익|매출)$"), ("영업이익", r"^영업이익(\(손실\))?$"),
@@ -396,8 +450,23 @@ ANSWER_NOTE = (
 )
 
 
+MARKET_NOTE = (
+    "\n\n위 자료는 네가 도구로 직접 찾아본 금융위원회 주가 자료(마지막 거래일 종가)야. 이걸로 답해. 기준일을 밝히고, "
+    "많이 오른 회사와 많이 내린 회사를 나눠 회사 이름·등락률·종가를 짧은 목록으로 정리해. 오르내린 이유는 자료에 없으니 지어내지 말고, "
+    "이유가 궁금하면 회사 이름으로 다시 물어보면 찾아보겠다고 한 줄로 말해. 사라·팔라고 하지 마."
+)
+
+
 def tool(kind: str, arg: str):
     """cf_chat이 부름 → (모델에게 줄 글, 출처 목록)"""
+    if kind == "market":  # 등락 상위 (2026-11-26)
+        try:
+            t, s = movers() if price_ready() else ("주가 자료 열쇠가 아직 없어 시세를 못 봤어.", [])
+        except Exception as e:  # noqa: BLE001
+            log(f"market 실패: {type(e).__name__} {str(e)[:80]}")
+            t, s = f"시세 자료를 가져오다 오류가 났어({type(e).__name__}). 지금은 확인할 수 없다고 말해.", []
+        log(f"market 도구: 출처 {len(s)}개")
+        return t + MARKET_NOTE, s
     names = [n.strip() for n in re.split(r"[,，/·]| 와 | 과 | 랑 ", arg) if n.strip()][: (3 if kind == "stock" else 2)]
     parts, src = [], []
     for n in names or [arg]:

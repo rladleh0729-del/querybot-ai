@@ -84,17 +84,21 @@ SEARCH_TAG = re.compile(r"<<\s*search\s*:\s*(.+?)\s*>>", re.S | re.I)
 THINK_OPEN = r"<<\s*[^<>/:\n]{1,8}\s*>>"
 THINK_CLOSE = r"<<\s*/\s*[^<>:\n]{0,8}\s*>>"
 THINK_BLOCK = re.compile(THINK_OPEN + r"\s*(.*?)\s*" + THINK_CLOSE, re.S)  # 2026-11-11: 모델이 <<생약>>처럼 틀리게 쓰기도 함
-ANY_TAG = re.compile(r"<<\s*(calc|search|remember|weather|stock|company)\s*:.*?>>", re.S | re.I)
+ANY_TAG = re.compile(r"<<\s*(calc|search|remember|weather|stock|company|market)\s*:.*?>>", re.S | re.I)
 # 기업·주가 도구 (2026-11-24 사용자: "실시간 주가 조회랑 조언용 주식 데이터" → "DART·전일 주가부터"): 열쇠(DART_API_KEY·DATA_GO_KR_KEY)가 있고
 # 주식·회사 얘기일 때만 안내(뉴런 아끼기). 모델이 <<stock: 이름>>·<<company: 이름>>을 쓰면 finance.tool이 자료 글을 돌려줌
 STOCK_TAG = re.compile(r"<<\s*stock\s*:\s*(.+?)\s*>>", re.S | re.I)
 COMPANY_TAG = re.compile(r"<<\s*company\s*:\s*(.+?)\s*>>", re.S | re.I)
+MARKET_TAG = re.compile(r"<<\s*market\s*:\s*(.*?)\s*>>", re.S | re.I)  # 등락 상위 (2026-11-26)
 FIN_ASK = re.compile(r"주가|주식|종목|시가\s?총액|시총|상장|코스피|코스닥|증시|실적|매출|영업\s?이익|순이익|재무|공시|사업\s?보고서|배당|PER|PBR|"
-                     r"투자|매수|매도|전망|성장\s?(성|가능성)|기업|회사|주주|분기|반도체주|\d{6}", re.I)
+                     r"투자|매수|매도|전망|성장\s?(성|가능성)|기업|회사|주주|분기|반도체주|\d{6}|"
+                     r"올랐|오른|내린|떨어|급등|급락|등락|상승|하락|거래일", re.I)
 FIN_PROMPT = (
     " (주식·기업 도구) 한국 상장사의 주가·시가총액·등락은 검색 말고 <<stock: 회사 이름>>(마지막 거래일 종가, 실시간 아님). "
     "한국 상장사의 사업 내용·방향·성장 가능성·실적·재무·공시를 묻거나 투자 판단을 물으면 <<company: 회사 이름>>(금융감독원 DART 공시와 주가). "
-    "여러 회사를 비교하면 쉼표로(<<stock: 삼성전자, SK하이닉스>>). 해외 주식·비상장 회사·최근 뉴스는 <<search>>."
+    "여러 회사를 비교하면 쉼표로(<<stock: 삼성전자, SK하이닉스>>). "
+    "특정 회사가 아니라 오늘·어제(마지막 거래일) 많이 오르거나 내린 회사, 시장 전체 흐름을 물으면 <<market: 등락>>(시가총액 상위 회사의 등락 상위). "
+    "해외 주식·비상장 회사·최근 뉴스는 <<search>>."
 )
 UNDERLINE = re.compile(r"<u\b[^>]*>(.*?)</u>", re.S | re.I)  # 사이트는 답 속 HTML을 글자 그대로 보여 줌 → 밑줄은 굵은 글씨로
 # 날씨 도구 (2026-11-09): 웹 검색으로 날씨를 찾으면 맛집·PDF가 걸려서, 날씨는 weather.py(OpenStreetMap 지명 + Open-Meteo 예보)로
@@ -172,6 +176,101 @@ def _fix_quiz(out: str) -> str:
             d = json.loads(raw, strict=False)
         except ValueError:
             return m.group(0)
+        return "```quiz\n" + json.dumps(d, ensure_ascii=False) + "\n```"
+    return QUIZ_BLOCK.sub(one, out)
+
+
+QUIZ_CHECK = (
+    "너는 문제 검토자야. 아래 문제를 처음부터 끝까지 직접 풀어(답을 짐작하지 말고 계산을 끝까지). "
+    "답 맨 끝 줄에는 JSON 한 줄만 써: 객관식이면 {\"answer\": 정답 보기 번호}, 정답이 보기에 없으면 {\"answer\": 0, \"value\": \"네가 구한 값\"}. "
+    "단답형이면 {\"answer\": \"정답\"}."
+)
+QUIZ_NUM = re.compile(r"^-?\d+(?:\.\d+)?(?:/-?\d+(?:\.\d+)?)?$")
+
+
+def _quiz_val(s):
+    """'1/2'·'0.5'·'$3$' → 숫자, 아니면 None"""
+    t = re.sub(r"[\s$,]|\\[,;!]", "", str(s if s is not None else "")).rstrip(".")
+    t = re.sub(r"\\d?frac\{(-?[\d.]+)\}\{(-?[\d.]+)\}", r"\1/\2", t)
+    if not QUIZ_NUM.match(t):
+        return None
+    if "/" in t:
+        a, b = t.split("/")
+        return float(a) / float(b) if float(b) else None
+    return float(t)
+
+
+def _qnum(x):
+    """'3'·3·3.0 → 3 (보기 번호 비교용)"""
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, float) and x.is_integer():
+        return int(x)
+    if isinstance(x, str) and x.strip().isdigit():
+        return int(x.strip())
+    return x
+
+
+def _quiz_solve(d: dict):
+    """정답을 숨긴 채 한 번 풀게 함 → (번호 또는 답 글, value)"""
+    q = d["q"] + ("\n" + "\n".join(f"{i + 1}. {ch}" for i, ch in enumerate(d["choices"])) if isinstance(d.get("choices"), list) else "")
+    r = _call([{"role": "system", "content": QUIZ_CHECK}, {"role": "user", "content": q}], think=True, max_tokens=2500)
+    txt = clean(r["choices"][0]["message"]["content"] or "")
+    for m in reversed(re.findall(r"\{[^{}]*\"answer\"[^{}]*\}", txt)):
+        try:
+            j = json.loads(LATEX_CMD.sub(r"\\\\", m), strict=False)
+        except ValueError:
+            continue
+        return _qnum(j.get("answer")), j.get("value")
+    return None, None
+
+
+def _check_quiz(out: str, kb_hits: list) -> str:
+    """퀴즈 검토 (2026-11-26 사용자: '쉬운 것도 검토를 안 하고 내서 답이 보기에 없고 있어도 틀린 경우가 많아')"""
+    blocks = list(QUIZ_BLOCK.finditer(out))
+    if not blocks:
+        return out
+    t0 = time.time()
+    official = None
+    if len(kb_hits or []) == 1 and str(kb_hits[0].get("answer") or "").strip().isdigit():
+        official = int(str(kb_hits[0]["answer"]).strip())
+
+    def one(m):
+        try:
+            d = json.loads(m.group(1).strip(), strict=False)
+        except ValueError:
+            return m.group(0)
+        if not isinstance(d, dict) or not isinstance(d.get("q"), str):
+            return m.group(0)
+        mc = isinstance(d.get("choices"), list) and len(d["choices"]) >= 2
+        try:
+            if mc and official is not None:  # 기출: 공식 정답 그대로
+                if 1 <= official <= len(d["choices"]) and d.get("answer") != official:
+                    log(f"퀴즈 검토: 기출 정답으로 고침 {d.get('answer')} → {official}")
+                    d["answer"] = official
+            elif mc and time.time() - t0 < 50:
+                a = _qnum(d.get("answer"))
+                s1, v1 = _quiz_solve(d)
+                if s1 != a and time.time() - t0 < 50:
+                    s2, v2 = _quiz_solve(d)
+                    if s2 == s1 and isinstance(s1, int) and 1 <= s1 <= len(d["choices"]):
+                        log(f"퀴즈 검토: 정답 번호 고침 {a} → {s1}")
+                        d["answer"] = s1
+                    elif s1 == 0 and s2 == 0 and v1 and isinstance(a, int) and 1 <= a <= len(d["choices"]) and \
+                            (_quiz_val(v1) is not None and _quiz_val(v1) == _quiz_val(v2) or str(v1).strip() == str(v2 or "").strip()):
+                        log(f"퀴즈 검토: 정답이 보기에 없어 {a}번 보기를 고침")
+                        d["choices"][a - 1] = str(v1).strip()
+                    else:
+                        log(f"퀴즈 검토: 결과가 엇갈려 그대로 둠 ({a} / {s1} / {s2})")
+            elif not mc and official is None and _quiz_val(d.get("answer")) is not None and time.time() - t0 < 50:
+                s1, _ = _quiz_solve(d)
+                if _quiz_val(s1) is not None and abs(_quiz_val(s1) - _quiz_val(d["answer"])) > 1e-9 and time.time() - t0 < 50:
+                    s2, _ = _quiz_solve(d)
+                    if _quiz_val(s2) is not None and abs(_quiz_val(s2) - _quiz_val(s1)) < 1e-9:
+                        log(f"퀴즈 검토: 단답 정답 고침 {d['answer']} → {s1}")
+                        d["answer"] = str(s1)
+        except (Busy, QuotaError, TooLong, AuthError) as e:
+            log(f"퀴즈 검토 건너뜀: {type(e).__name__}")
         return "```quiz\n" + json.dumps(d, ensure_ascii=False) + "\n```"
     return QUIZ_BLOCK.sub(one, out)
 
@@ -1103,13 +1202,13 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     if kb_hits:
         extra["sources"] = kb.sources(kb_hits)
     for _ in range(5):  # 도구는 한 질문에 날씨 1번 + 검색 1번 + 계산 2번 + 기업·주가 1번까지
-        mf = (COMPANY_TAG.search(out) or STOCK_TAG.search(out)) if fins < 1 and finance.ready() else None
+        mf = (COMPANY_TAG.search(out) or STOCK_TAG.search(out) or MARKET_TAG.search(out)) if fins < 1 and finance.ready() else None
         mw = WEATHER_TAG.search(out) if not weathered else None
         ms = SEARCH_TAG.search(out) if USE_SEARCH and not searched else None
         mc = CALC_TAG.search(out) if USE_CALC and calcs < 2 else None
         if mf:
             fins += 1
-            kind = "company" if mf.re is COMPANY_TAG else "stock"
+            kind = "company" if mf.re is COMPANY_TAG else "market" if mf.re is MARKET_TAG else "stock"
             note, src = finance.tool(kind, mf.group(1).strip()[:80])
             if src:
                 extra.setdefault("sources", []).extend(src)
@@ -1168,6 +1267,8 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     out = ANY_TAG.sub("", out).strip()  # 혹시 남은 도구 표시는 지움
     out = UNDERLINE.sub(lambda m: "**" + m.group(1).strip() + "**", out)
     out = _fix_quiz(out)
+    if QUIZ_BLOCK.search(out):
+        out = _check_quiz(out, kb_hits)  # 2026-11-26: 내기 전에 정답 검토
     # 외국 글자가 섞이면 한 번 더(그래도 섞이면 그 글자만 지움) — 사용자가 그 글자(일본어·중국어·러시아어 등)로 쓴 경우는 그대로 둔다
     if not _foreign_ok(text, history) and _has_stray(out):
         out = _strip_stray(ANY_TAG.sub("", clean(_call(msgs)["choices"][0]["message"]["content"] or ""))).strip()
