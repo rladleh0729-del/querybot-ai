@@ -59,7 +59,7 @@ def items() -> list:
         if _st["err"] and now - _st["loaded"] < 300:
             return _st["items"]
         try:
-            rows = _q("SELECT id, school, grade, semester, term, year, no, kind, points, text, choices, answer, figure, solution, full, (fig IS NOT NULL AND fig != '') AS has_fig FROM kb_school")
+            rows = _q("SELECT id, school, grade, semester, term, year, no, kind, points, text, choices, answer, figure, solution, full, level, (fig IS NOT NULL AND fig != '') AS has_fig FROM kb_school")
             for r in rows:
                 try:
                     r["choices"] = json.loads(r.get("choices") or "null")
@@ -143,7 +143,21 @@ def want(text: str):
         c["kind"] = "객관식"
     if re.search(r"그림|도형|입체", t):
         c["figure"] = True
+    lv = level_word(t)
+    if lv:
+        c["level"] = lv
     return c
+
+
+def level_word(t: str):
+    """난이도 말 → 'killer'(5, 없으면 4) · 'hard'(4 이상) · 'easy'(2 이하) · None(말 없음 = 3 이상)"""
+    if re.search(r"킬러|최고\s?난도|초\s?고난도|가장\s?어려|제일\s?어려", t):
+        return "killer"
+    if re.search(r"고난도|어려운|어렵|심화|난이도\s?(높|상)|빡센|까다로", t):
+        return "hard"
+    if re.search(r"쉬운|쉽게|기본|기초|난이도\s?(낮|하)", t):
+        return "easy"
+    return None
 
 
 MORE = re.compile(r"^\s*(다음\s?(문제|거|꺼)?|하나\s?더|한\s?(문제|개)\s?더|또\s?(줘|내\s?줘|하나|내\s?봐)?|더\s?(줘|내\s?줘|풀래)|계속|next)\s*(줘|요|주세요)?\s*[!.?~]*\s*$", re.I)
@@ -154,14 +168,33 @@ def more(text: str, history: list):
     if not MORE.match(text or ""):
         return None
     r = ref(history)
-    return {"grade": r["grade"], "semester": r["semester"]} if r else None
+    if not r:
+        return None
+    c = {"grade": r["grade"], "semester": r["semester"]}
+    lv = r.get("level") or 0
+    if lv >= 5:
+        c["level"] = "killer"  # 앞 문제가 킬러였으면 '하나 더'도 킬러
+    elif lv >= 4:
+        c["level"] = "hard"
+    elif lv and lv <= 2:
+        c["level"] = "easy"
+    return c
 
 
 def pick(cond: dict):
     its = items()
     if not its:
         return None
-    pool = [it for it in its if all(it.get(k) == v for k, v in cond.items() if k not in ("figure", "kind"))]
+    pool = [it for it in its if all(it.get(k) == v for k, v in cond.items() if k not in ("figure", "kind", "level"))]
+    # 난이도: 킬러 5 → 없으면 4, 고난도 4 이상, 쉬운 2 이하, 말 없으면 3 이상(사용자는 여러 단계 문제를 좋아함). 맞는 게 없으면 조건을 풂
+    lvw = cond.get("level")
+    steps = {"killer": [lambda v: v >= 5, lambda v: v >= 4], "hard": [lambda v: v >= 4, lambda v: v >= 3],
+             "easy": [lambda v: v <= 2, lambda v: v <= 3]}.get(lvw, [lambda v: v >= 3])
+    for ok in steps:
+        lp = [it for it in pool if isinstance(it.get("level"), int) and ok(it["level"])]
+        if lp:
+            pool = lp
+            break
     if cond.get("kind"):
         pool = [it for it in pool if (it.get("kind") or "") == cond["kind"]] or pool
     if cond.get("figure"):
@@ -199,7 +232,8 @@ def _nums(ans: str) -> list:
 
 def quiz(it) -> str:
     """모델 없이 바로 낼 답: 문항 이름(다시 찾는 표시이기도 함) + 퀴즈 카드"""
-    head = f"**{label(it)}**" + (f" ({it['points']:g}점)" if isinstance(it.get("points"), (int, float)) and it["points"] else "")
+    lv = it.get("level") if isinstance(it.get("level"), int) else 0
+    head = f"**{label(it)}**" + (f" · 난이도 {'★' * lv}{'☆' * (5 - lv)}" + (" 킬러" if lv >= 5 else "") if lv else "")
     ch = it.get("choices") or []
     ans = (it.get("answer") or "").strip()
     nums = _nums(ans) if ch else []
