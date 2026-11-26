@@ -39,6 +39,7 @@ from np_model import NPModel
 from np_sampling import banned_ids, pick_next, space_id_of
 import wiki_search  # 지식 질문은 위키백과에서 찾아 답함 (2026-10-20)
 import acct_store  # 로그인한 사람의 대화를 Cloudflare D1에 저장 (2026-11-15)
+import school  # 주인 전용 학교 기출 — 저장된 대화를 다시 열 때 문항 그림 (2026-11-26)
 import cf_chat  # 'Gemma 4'(Cloudflare Workers AI 무료) — 열쇠(CF_ACCOUNT_ID·CF_API_TOKEN)가 있을 때만 목록에 나옴 (2026-11-08)
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -678,6 +679,25 @@ def owner_check(body: OwnerIn, request: Request):
     if not (session_owner(body.s) or is_owner(body.gd)):
         return {"owner": False, "models": []}
     return {"owner": True, "models": [{"key": RUNPOD_KEY, "label": RUNPOD_LABEL}]}
+
+
+class SchoolImgIn(BaseModel):
+    s: str = Field(default="", max_length=2000)
+    label: str = Field(default="", max_length=120)
+
+
+@app.post("/school/img")
+def school_img(body: SchoolImgIn, request: Request):
+    # 저장된 대화를 다시 열면 학교 기출 문항 그림이 없음(그림은 대화 기록에 안 넣음) → 페이지가 문항 이름으로 다시 받음. 주인만 (2026-11-26)
+    check_rate_limit(client_ip(request))
+    c = read_session(body.s) if body.s else None
+    if not (c and c.get("o")):
+        raise HTTPException(status_code=403, detail="주인 계정으로 로그인했을 때만 볼 수 있어요")
+    it = school.find_label(body.label)
+    src = school.image(it["id"]) if it else ""
+    if not src:
+        raise HTTPException(status_code=404, detail="그 문항이 없어요")
+    return {"src": src, "alt": school.label(it)}
 
 
 @app.post("/owner/warm")

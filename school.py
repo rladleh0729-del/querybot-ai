@@ -193,7 +193,23 @@ def quiz(it) -> str:
     return head + "\n\n```quiz\n" + json.dumps(card, ensure_ascii=False) + "\n```"
 
 
-REF = re.compile(r"\*\*(\S+학교) (20\d\d)년 ([123])학년 ([12])학기 (중간|기말)고사 (서술형 )?(\d+)번\*\*")
+REF_CORE = r"(\S+학교) (20\d\d)년 ([123])학년 ([12])학기 (중간|기말)고사 (서술형 )?(\d+)번"
+REF = re.compile(r"\*\*" + REF_CORE + r"\*\*")
+
+
+def find_label(text: str):
+    """'이수중학교 2024년 1학년 2학기 기말고사 10번' 같은 이름 → 문항 (저장된 대화를 다시 열 때 그림을 다시 받음)"""
+    m = re.search(REF_CORE, text or "")
+    return _match(m) if m else None
+
+
+def _match(m):
+    y, g, s, term, sv, no = int(m.group(2)), int(m.group(3)), int(m.group(4)), m.group(5), m.group(6), int(m.group(7))
+    no = no + 100 if sv else no
+    for it in items():
+        if it["year"] == y and it["grade"] == g and it["semester"] == s and it["term"] == term and it["no"] == no and it["school"] == m.group(1):
+            return it
+    return None
 
 
 def ref(history: list):
@@ -206,12 +222,7 @@ def ref(history: list):
         m = REF.search(content or "")
         if not m:  # 가장 최근 답이 기출 문제가 아니면 끝(옛 문제를 다시 끌어오지 않음)
             return None
-        y, g, s, term, sv, no = int(m.group(2)), int(m.group(3)), int(m.group(4)), m.group(5), m.group(6), int(m.group(7))
-        no = no + 100 if sv else no
-        for it in items():
-            if it["year"] == y and it["grade"] == g and it["semester"] == s and it["term"] == term and it["no"] == no and it["school"] == m.group(1):
-                return it
-        return None
+        return _match(m)
     return None
 
 
