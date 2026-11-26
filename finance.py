@@ -277,6 +277,120 @@ def movers(top: int = 8, universe: int = 200):
     return s, [{"title": f"주식시세 {_day(last)} (금융위원회·공공데이터포털)", "url": PRICE_SRC}]
 
 
+# ---------- 미국 주식 (2026-11-26 사용자: "해외 주식들도 중요한데. 특히 미국") ----------
+# 야후 파이낸스 차트(키 없음, 지연 시세). 여러 종목은 spark로 20개씩
+YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/"
+YF_SPARK = "https://query1.finance.yahoo.com/v8/finance/spark?"
+US_NAMES = {  # 티커 → 한글 이름(맨 앞이 보여 줄 이름, 나머지는 별칭)
+    "AAPL": "애플", "MSFT": "마이크로소프트|마소|MS", "NVDA": "엔비디아", "AMZN": "아마존", "GOOGL": "알파벳|구글", "META": "메타|페이스북",
+    "TSLA": "테슬라", "AVGO": "브로드컴", "BRK-B": "버크셔해서웨이|버크셔", "LLY": "일라이릴리|릴리", "JPM": "JP모건|제이피모건",
+    "V": "비자", "WMT": "월마트", "XOM": "엑슨모빌|엑손모빌", "UNH": "유나이티드헬스", "MA": "마스터카드", "ORCL": "오라클",
+    "COST": "코스트코", "HD": "홈디포", "PG": "P&G|프록터앤드갬블", "JNJ": "존슨앤드존슨|존슨앤존슨", "NFLX": "넷플릭스",
+    "BAC": "뱅크오브아메리카", "ABBV": "애브비", "CRM": "세일즈포스", "KO": "코카콜라", "AMD": "AMD", "CVX": "셰브론",
+    "MRK": "머크", "PEP": "펩시코|펩시", "ADBE": "어도비", "CSCO": "시스코", "MCD": "맥도날드", "ABT": "애보트",
+    "IBM": "IBM", "GE": "GE|제너럴일렉트릭", "QCOM": "퀄컴", "INTU": "인튜이트", "TXN": "텍사스인스트루먼트", "CAT": "캐터필러",
+    "AMGN": "암젠", "DIS": "디즈니|월트디즈니", "NOW": "서비스나우", "ISRG": "인튜이티브서지컬", "VZ": "버라이즌",
+    "PFE": "화이자", "UBER": "우버", "GS": "골드만삭스", "MS": "모건스탠리", "INTC": "인텔", "MU": "마이크론",
+    "PLTR": "팔란티어", "TSM": "TSMC|대만반도체", "ASML": "ASML", "ARM": "ARM|암홀딩스", "BA": "보잉", "NKE": "나이키",
+    "SBUX": "스타벅스", "COIN": "코인베이스", "CPNG": "쿠팡", "IONQ": "아이온큐", "SMCI": "슈퍼마이크로", "PYPL": "페이팔",
+    "SHOP": "쇼피파이", "ABNB": "에어비앤비", "RBLX": "로블록스", "RIVN": "리비안", "LCID": "루시드", "NIO": "니오",
+    "BABA": "알리바바", "SNOW": "스노우플레이크", "CRWD": "크라우드스트라이크", "MRVL": "마벨", "SOFI": "소파이",
+    "MSTR": "스트래티지|마이크로스트래티지", "NVO": "노보노디스크", "T": "AT&T", "QQQ": "QQQ", "SPY": "SPY",
+    "^GSPC": "S&P 500|S&P500|에스앤피", "^IXIC": "나스닥 종합|나스닥지수", "^DJI": "다우|다우존스",
+}
+US_ALIAS = {}
+for _t, _ns in US_NAMES.items():
+    for _n in _ns.split("|"):
+        US_ALIAS[_norm(_n)] = _t
+US_BIG = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "BRK-B", "LLY", "JPM", "V", "WMT", "XOM", "UNH", "MA",
+          "ORCL", "COST", "HD", "PG", "JNJ", "NFLX", "BAC", "ABBV", "CRM", "KO", "AMD", "CVX", "MRK", "PEP", "ADBE", "CSCO", "MCD",
+          "ABT", "IBM", "GE", "QCOM", "INTU", "TXN", "CAT", "AMGN", "DIS", "NOW", "ISRG", "VZ", "PFE", "UBER", "GS", "MS", "INTC",
+          "MU", "PLTR", "TSM", "ASML", "BA", "NKE", "SBUX", "COIN", "PYPL", "SHOP"]
+US_INDEX = ["^GSPC", "^IXIC", "^DJI"]
+
+
+def us_name(t: str) -> str:
+    return US_NAMES.get(t, "").split("|")[0] or t
+
+
+def us_ticker(name: str):
+    """한글 이름·별칭·티커 → 미국 티커, 아니면 None (한국 회사 이름은 먼저 한국에서 찾음)"""
+    n = _norm(name)
+    if n in US_ALIAS:
+        return US_ALIAS[n]
+    s = name.strip().upper().replace(".", "-")
+    if re.fullmatch(r"\^?[A-Z]{1,5}(-[A-Z])?", s):
+        return s
+    return None
+
+
+def _us_chart(t: str):
+    def go():
+        raw = _get(YF_CHART + urllib.parse.quote(t) + "?range=1y&interval=1d", timeout=20)
+        r = json.loads(raw)["chart"]["result"][0]
+        closes = r["indicators"]["quote"][0]
+        pts = [(ts, c) for ts, c in zip(r.get("timestamp") or [], closes.get("close") or []) if c is not None]
+        return r["meta"], pts, closes
+    return _cached("us:" + t, 1800, go)
+
+
+def us_price(t: str):
+    meta, pts, q = _us_chart(t)
+    if len(pts) < 2:
+        return f"'{t}' 미국 종목 시세를 찾지 못했어.", []
+    tz = timezone(timedelta(seconds=int(meta.get("gmtoffset") or -18000)))
+    last_ts, last = pts[-1]
+    prev = pts[-2][1]
+    day = datetime.fromtimestamp(last_ts, tz).strftime("%Y-%m-%d")
+
+    def chg(days):
+        target = last_ts - days * 86400
+        old = next((c for ts, c in reversed(pts) if ts <= target), None)
+        return f"{(last - old) / old * 100:+.1f}% (${old:,.2f})" if old else "자료 없음"
+    nm = meta.get("longName") or meta.get("shortName") or t
+    kr = us_name(t)
+    hi = meta.get("fiftyTwoWeekHigh") or max(c for _, c in pts)
+    lo = meta.get("fiftyTwoWeekLow") or min(c for _, c in pts)
+    vol = meta.get("regularMarketVolume")
+    s = (f"[미국 주가 · {kr + ' ' if kr != t else ''}{nm}({t}, {meta.get('fullExchangeName') or meta.get('exchangeName', '')}) · "
+         f"기준 {day} 미국 시각 마지막 값 — 실시간 아님(지연), 달러]\n"
+         f"마지막 값 ${last:,.2f}, 전일 대비 {last - prev:+,.2f}달러({(last - prev) / prev * 100:+.2f}%)"
+         + (f", 고가 ${meta['regularMarketDayHigh']:,.2f} · 저가 ${meta['regularMarketDayLow']:,.2f}" if meta.get("regularMarketDayHigh") else "")
+         + (f"\n거래량 {int(vol):,}주" if vol else "")
+         + f"\n52주 최고 ${hi:,.2f}, 52주 최저 ${lo:,.2f}\n변화: 1개월 {chg(30)}, 3개월 {chg(91)}, 1년 {chg(365)}")
+    return s, [{"title": f"{kr if kr != t else nm} ({t}) 시세 (Yahoo Finance)", "url": "https://finance.yahoo.com/quote/" + urllib.parse.quote(t)}]
+
+
+def _us_spark(syms: list) -> dict:
+    out = {}
+    for i in range(0, len(syms), 20):
+        part = syms[i:i + 20]
+        raw = _get(YF_SPARK + urllib.parse.urlencode({"symbols": ",".join(part), "range": "5d", "interval": "1d"}), timeout=25)
+        for k, v in json.loads(raw).items():
+            cl = [c for c in (v.get("close") or []) if c is not None]
+            ts = [t for t, c in zip(v.get("timestamp") or [], v.get("close") or []) if c is not None]
+            if len(cl) >= 2:
+                out[k] = (cl[-1], cl[-2], ts[-1] if ts else 0)
+    return out
+
+
+def us_movers(top: int = 8):
+    data = _cached("us:market", 1800, lambda: _us_spark(US_INDEX + US_BIG))
+    rows = [(t, *data[t]) for t in US_BIG if t in data]
+    if not rows:
+        return "미국 시세를 가져오지 못했어. 지금은 확인할 수 없다고 말해.", []
+    pct = lambda r: (r[1] - r[2]) / r[2] * 100  # noqa: E731
+    up = sorted(rows, key=pct, reverse=True)[:top]
+    dn = sorted(rows, key=pct)[:top]
+    day = datetime.fromtimestamp(max(r[3] for r in rows), timezone(timedelta(hours=-5))).strftime("%Y-%m-%d")
+    idx = ", ".join(f"{us_name(t)} {data[t][0]:,.2f}({(data[t][0] - data[t][1]) / data[t][1] * 100:+.2f}%)" for t in US_INDEX if t in data)
+    line = lambda r: f"- {us_name(r[0])}({r[0]}) {pct(r):+.2f}% · ${r[1]:,.2f}"  # noqa: E731
+    s = (f"[미국 등락 · {day} 미국 시각 마지막 값 기준 — 실시간 아님(지연), 큰 회사 {len(rows)}곳 중]\n"
+         + (f"지수: {idx}\n" if idx else "")
+         + "많이 오른 회사:\n" + "\n".join(line(r) for r in up) + "\n많이 내린 회사:\n" + "\n".join(line(r) for r in dn))
+    return s, [{"title": f"미국 주요 종목 시세 {day} (Yahoo Finance)", "url": "https://finance.yahoo.com/markets/"}]
+
+
 # ---------- DART 회사 정보 ----------
 REPRT = {"03": "11013", "06": "11012", "09": "11014", "12": "11011"}
 ACCTS = [("매출액", r"^(매출액|수익\(매출액\)|영업수익|매출)$"), ("영업이익", r"^영업이익(\(손실\))?$"),
@@ -441,8 +555,8 @@ def company(name: str):
 
 
 ANSWER_NOTE = (
-    "\n\n위 자료는 네가 도구로 직접 찾아본 금융감독원 DART 공시·금융위원회 주가 자료야(사용자가 준 자료처럼 말하지 마). 이걸로 원래 질문에 답해. "
-    "숫자는 자료 그대로 쓰고 주가는 기준일을 밝혀(실시간 값이 아님). "
+    "\n\n위 자료는 네가 도구로 직접 찾아본 금융감독원 DART 공시·주가 자료(한국은 금융위원회, 미국은 야후 파이낸스 지연 시세)야(사용자가 준 자료처럼 말하지 마). 이걸로 원래 질문에 답해. "
+    "숫자는 자료 그대로 쓰고 주가는 기준일을 밝혀(실시간 값이 아님, 미국 주식은 달러). "
     "회사 방향·성장 가능성을 물으면 공시의 사업 개요·산업 여건과 실적 흐름(매출·이익 증감, 이익률, 부채비율)을 근거로 정리하고, "
     "좋은 점과 위험 요인을 함께 말해. 투자 판단을 물어도 사라·팔라고 단정하지 말고 판단에 쓸 근거와 따져 볼 점을 정리해 준 뒤, "
     "투자 권유가 아니고 판단과 책임은 본인에게 있다는 점을 끝에 한 줄로 밝혀. 자료에 없는 숫자는 지어내지 말고, 최신 뉴스가 필요하면 그렇다고 말해. "
@@ -451,7 +565,7 @@ ANSWER_NOTE = (
 
 
 MARKET_NOTE = (
-    "\n\n위 자료는 네가 도구로 직접 찾아본 금융위원회 주가 자료(마지막 거래일 종가)야. 이걸로 답해. 기준일을 밝히고, "
+    "\n\n위 자료는 네가 도구로 직접 찾아본 주가 자료(한국은 금융위원회 마지막 거래일 종가, 미국은 야후 파이낸스 지연 시세·달러)야. 이걸로 답해. 기준일을 밝히고, "
     "많이 오른 회사와 많이 내린 회사를 나눠 회사 이름·등락률·종가를 짧은 목록으로 정리해. 오르내린 이유는 자료에 없으니 지어내지 말고, "
     "이유가 궁금하면 회사 이름으로 다시 물어보면 찾아보겠다고 한 줄로 말해. 사라·팔라고 하지 마."
 )
@@ -459,18 +573,33 @@ MARKET_NOTE = (
 
 def tool(kind: str, arg: str):
     """cf_chat이 부름 → (모델에게 줄 글, 출처 목록)"""
-    if kind == "market":  # 등락 상위 (2026-11-26)
-        try:
-            t, s = movers() if price_ready() else ("주가 자료 열쇠가 아직 없어 시세를 못 봤어.", [])
-        except Exception as e:  # noqa: BLE001
-            log(f"market 실패: {type(e).__name__} {str(e)[:80]}")
-            t, s = f"시세 자료를 가져오다 오류가 났어({type(e).__name__}). 지금은 확인할 수 없다고 말해.", []
-        log(f"market 도구: 출처 {len(s)}개")
-        return t + MARKET_NOTE, s
+    if kind == "market":  # 등락 상위 (2026-11-26) — 한국·미국(지역 말이 없으면 둘 다)
+        us_only = bool(re.search(r"미국|US|나스닥|뉴욕|S&P|다우|해외", arg, re.I))
+        kr_only = bool(re.search(r"한국|국내|코스피|코스닥", arg))
+        parts, src = [], []
+        for region in (["kr"] if kr_only and not us_only else ["us"] if us_only and not kr_only else ["kr", "us"]):
+            try:
+                if region == "kr":
+                    t, s = movers(top=8 if kr_only else 6) if price_ready() else ("한국 주가 자료 열쇠가 아직 없어 시세를 못 봤어.", [])
+                else:
+                    t, s = us_movers(top=8 if us_only else 6)
+            except Exception as e:  # noqa: BLE001
+                log(f"market {region} 실패: {type(e).__name__} {str(e)[:80]}")
+                t, s = f"{'한국' if region == 'kr' else '미국'} 시세 자료를 가져오다 오류가 났어({type(e).__name__}). 그쪽은 지금 확인할 수 없다고 말해.", []
+            parts.append(t)
+            src += s
+        log(f"market 도구: 출처 {len(src)}개")
+        return "\n\n".join(parts) + MARKET_NOTE, src
     names = [n.strip() for n in re.split(r"[,，/·]| 와 | 과 | 랑 ", arg) if n.strip()][: (3 if kind == "stock" else 2)]
     parts, src = [], []
     for n in names or [arg]:
         try:
+            ut = us_ticker(n) if (_norm(n) in US_ALIAS or not (price_ready() and find(n))) else None
+            if ut:  # 미국 종목 (2026-11-26)
+                t, s = us_price(ut)
+                parts.append(t)
+                src += s
+                continue
             if kind == "company" and dart_ready():
                 t, s = company(n)
             elif price_ready():

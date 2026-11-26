@@ -92,13 +92,15 @@ COMPANY_TAG = re.compile(r"<<\s*company\s*:\s*(.+?)\s*>>", re.S | re.I)
 MARKET_TAG = re.compile(r"<<\s*market\s*:\s*(.*?)\s*>>", re.S | re.I)  # 등락 상위 (2026-11-26)
 FIN_ASK = re.compile(r"주가|주식|종목|시가\s?총액|시총|상장|코스피|코스닥|증시|실적|매출|영업\s?이익|순이익|재무|공시|사업\s?보고서|배당|PER|PBR|"
                      r"투자|매수|매도|전망|성장\s?(성|가능성)|기업|회사|주주|분기|반도체주|\d{6}|"
-                     r"올랐|오른|내린|떨어|급등|급락|등락|상승|하락|거래일", re.I)
+                     r"올랐|오른|내린|떨어|급등|급락|등락|상승|하락|거래일|"
+                     r"미국\s?주|해외\s?주|나스닥|뉴욕\s?증시|S&P|다우|빅테크|엔비디아|테슬라|애플|마이크로소프트|아마존|알파벳|구글\s?주|메타|넷플릭스|팔란티어|브로드컴", re.I)
 FIN_PROMPT = (
     " (주식·기업 도구) 한국 상장사의 주가·시가총액·등락은 검색 말고 <<stock: 회사 이름>>(마지막 거래일 종가, 실시간 아님). "
     "한국 상장사의 사업 내용·방향·성장 가능성·실적·재무·공시를 묻거나 투자 판단을 물으면 <<company: 회사 이름>>(금융감독원 DART 공시와 주가). "
     "여러 회사를 비교하면 쉼표로(<<stock: 삼성전자, SK하이닉스>>). "
-    "특정 회사가 아니라 오늘·어제(마지막 거래일) 많이 오르거나 내린 회사, 시장 전체 흐름을 물으면 <<market: 등락>>(시가총액 상위 회사의 등락 상위). "
-    "해외 주식·비상장 회사·최근 뉴스는 <<search>>."
+    "미국 주식도 같은 <<stock: 애플>>·<<stock: NVDA>>(한글 이름이나 티커, 달러·지연 시세). "
+    "특정 회사가 아니라 오늘·어제(마지막 거래일) 많이 오르거나 내린 회사, 시장 전체 흐름을 물으면 <<market: 한국>>·<<market: 미국>>·<<market: 전체>>(큰 회사들의 등락 상위, 미국은 지수 포함). "
+    "미국 밖 해외 주식·비상장 회사·최근 뉴스는 <<search>>."
 )
 UNDERLINE = re.compile(r"<u\b[^>]*>(.*?)</u>", re.S | re.I)  # 사이트는 답 속 HTML을 글자 그대로 보여 줌 → 밑줄은 굵은 글씨로
 # 날씨 도구 (2026-11-09): 웹 검색으로 날씨를 찾으면 맛집·PDF가 걸려서, 날씨는 weather.py(OpenStreetMap 지명 + Open-Meteo 예보)로
@@ -168,10 +170,14 @@ LATEX_CMD = re.compile(r"(?<!\\)\\(?=(?:d?frac|times|div|sqrt|cdot|cdots|ldots|d
 QUIZ_BLOCK = re.compile(r"```[ \t]*(?:quiz|퀴즈)[ \t]*\n?([\s\S]*?)```", re.I)  # 'quiz {…}'처럼 같은 줄에 써도 (2026-11-22)
 
 
+BAD_ESC = re.compile(r'\\\\|\\(?![/"bfnrtu])')  # 바른 \\ 짝 또는, JSON 이스케이프가 아닌 홀로 역슬래시
+
+
 def _fix_quiz(out: str) -> str:
     """퀴즈 블록의 JSON을 고쳐 다시 씀: LaTeX 역슬래시가 JSON 특수 문자(\f·\t…)로 읽히지 않게 (2026-11-22)"""
     def one(m):
         raw = LATEX_CMD.sub(r"\\\\", m.group(1).strip())
+        raw = BAD_ESC.sub(lambda e: e.group(0) if len(e.group(0)) == 2 else "\\\\", raw)  # \{·\}·\, 같은 것 (2026-11-26)
         try:
             d = json.loads(raw, strict=False)
         except ValueError:
