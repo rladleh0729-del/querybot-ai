@@ -846,7 +846,8 @@ def _chat_core(body: ChatIn, request: Request):
             args = dict(think=body.think, memory=body.memory, location=body.location.model_dump() if body.location else None,
                         style=body.style, instructions=body.instructions, older=[str(o)[:200] for o in body.older],
                         browser=bool(body.browser) and body.model in (GEMMA_KEY, RUNPOD_KEY),
-                        browser_recent=bool(body.browser_recent))  # 브라우저 도구는 Gemma만(행동 형식 학습)
+                        browser_recent=bool(body.browser_recent),  # 브라우저 도구는 Gemma만(행동 형식 학습)
+                        owner=bool((read_session(body.s) or {}).get("o")) if body.s else False)  # 주인 학교 기출 (2026-11-26)
             try:
                 if body.model == RUNPOD_KEY:
                     try:
@@ -933,6 +934,8 @@ def _chat_core(body: ChatIn, request: Request):
             out["fallback"] = extra["fallback"]  # Gemma 4 대신 기본 모델이 답함 (AuthError·QuotaError·Busy)
         if extra.get("browser_task"):
             out["browser_task"] = extra["browser_task"]  # 페이지가 확장(쿼리봇 브라우저 도구)과 /agent/step으로 실제로 함 (2026-11-22)
+        if extra.get("kb_images"):
+            out["kb_images"] = extra["kb_images"][:2]  # 주인 학교 기출 문항 그림(data URL) — 페이지가 답 위에 보여 줌 (2026-11-26)
         if extra.get("ask_location"):
             out["ask_location"] = True  # 위치를 몰라 지역을 물음 → 페이지가 답 아래에 '위치 공유 켜기' 단추 (2026-11-14)
     if body.model == GEMMA_KEY:

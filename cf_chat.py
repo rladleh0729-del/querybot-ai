@@ -23,6 +23,7 @@ import web_search
 import wiki_search
 import kb  # 지식 창고: 평가원 수능 기출 (2026-11-22, 2026-11-24 전 영역)
 import finance  # 기업·주가 도구: 금융감독원 DART + 금융위원회 주식시세 (2026-11-24)
+import school  # 주인 전용 학교 내신 기출(문항 그림 그대로) (2026-11-26)
 
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
@@ -998,17 +999,19 @@ MAX_INSTR = 1500
 
 
 def reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
-          style: str = "", instructions: str = "", provider: str = "cf", older=None, browser: bool = False, browser_recent: bool = False):
+          style: str = "", instructions: str = "", provider: str = "cf", older=None, browser: bool = False, browser_recent: bool = False,
+          owner: bool = False):
     """provider = "cf"(Gemma 4, Cloudflare) 또는 "groq"(gpt-oss-120b). older = 앞 대화 8개보다 오래된 사용자 말(줄임). 나머지는 _reply 설명 그대로."""
     tok = _provider.set("groq" if provider == "groq" and groq_ready() else "runpod" if provider == "runpod" and runpod_ready() else "cf")
     try:
-        return _reply(text, history, images, files, think, memory, location, style, instructions, older or [], browser, browser_recent)
+        return _reply(text, history, images, files, think, memory, location, style, instructions, older or [], browser, browser_recent, owner)
     finally:
         _provider.reset(tok)
 
 
 def _reply(text: str, history: list, images=None, files=None, think: bool = False, memory=None, location=None,
-           style: str = "", instructions: str = "", older=None, browser: bool = False, browser_recent: bool = False):
+           style: str = "", instructions: str = "", older=None, browser: bool = False, browser_recent: bool = False,
+           owner: bool = False):
     """(답, 덧붙일 정보 또는 None). 덧붙일 정보 = {"sources": [{title, url}], "searched": 검색어,
     "thought": {"seconds", "summary", "asked"}, "remember": [새로 기억할 한 줄]}.
     history는 app.py의 Turn 목록(role, content). images = data URL 목록, files = [{name, text}],
@@ -1016,6 +1019,18 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     if len(text) > MAX_TEXT_CHARS:  # 거의 없는 일: 책 한 권 넘는 글 → 앞·끝만 (가운데 생략)
         cut = len(text) - MAX_TEXT_CHARS
         text = text[:120000] + f"\n\n…(글이 너무 길어서 가운데 {cut:,}자는 빼고 보냄)…\n\n" + text[-80000:]
+    # 주인 학교 기출 (2026-11-26 사용자: '그걸로 기출 내주라 하면 편하겠다'): 주인 계정일 때만, '1학년 기출 내줘' 같은 말이면
+    # 모델 없이 바로 문항 그림 + 퀴즈 카드(정답은 카드 속에 숨김) — 빠르고 뉴런을 안 씀
+    if owner and not images and not files:
+        sc = school.want(text)
+        sc = school.more(text, history) if sc is None else sc
+        if sc is not None and school.items():
+            it = school.pick(sc)
+            if it:
+                img = school.image(it["id"])
+                log(f"학교 기출: {it['grade']}학년 {it['no']}번 냄")
+                return school.quiz(it), {"kb_images": [{"src": img, "alt": school.label(it)}] if img else []}
+            return "그 조건에 맞는 학교 기출이 창고에 없어요. 지금 있는 시험: " + school.summary(), None
     asked, secs = think_request(text)
     think = bool(think or asked)
     if think and not asked and SMALL_TALK.match(text or ""):  # 단추만 켜져 있고 인사·맞장구면 생각 없이 바로
@@ -1134,6 +1149,17 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
                  + " ".join(f"({i + 1}) {r}" for i, r in enumerate(rules)) + ")") if rules else ""
     # 지식 창고 (2026-11-22): 기출 번호를 말하면 답하기 전에 원문을 넣어 줌 — 인터넷 검색보다 정확하고 호출이 늘지 않음
     kb_hits = kb.lookup(text)
+    # 앞에서 낸 학교 기출을 이어서 물으면(풀이·채점) 그 문항 그림과 공식 정답을 같이 줌 — 그림은 Gemma 4(Cloudflare)만 볼 수 있음
+    sref = school.ref(history) if owner else None
+    if sref:
+        msgs[0] = {"role": "system", "content": msgs[0]["content"] + " " + school.note(sref)}
+        system_plain += " " + school.note(sref)
+        if _provider.get() == "cf" and not images:
+            try:
+                simg = school.image(sref["id"])
+                images = [simg] if simg else images
+            except Exception:  # noqa: BLE001 — 그림을 못 받아도 글로 답함
+                pass
     if kb_hits:
         msgs[0] = {"role": "system", "content": msgs[0]["content"] + " " + kb.note(kb_hits)}
         system_plain += " " + kb.note(kb_hits)
