@@ -694,10 +694,10 @@ def school_img(body: SchoolImgIn, request: Request):
     if not (c and c.get("o")):
         raise HTTPException(status_code=403, detail="주인 계정으로 로그인했을 때만 볼 수 있어요")
     it = school.find_label(body.label)
-    src = school.image(it["id"]) if it else ""
-    if not src:
-        raise HTTPException(status_code=404, detail="그 문항이 없어요")
-    return {"src": src, "alt": school.label(it)}
+    pics = school.pictures(it) if it else []
+    if not pics:
+        raise HTTPException(status_code=404, detail="그 문항에 붙일 그림이 없어요")
+    return pics[0]  # {src, alt, full?} — 도형만이면 full 없음 (2026-11-26)
 
 
 @app.post("/owner/warm")

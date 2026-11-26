@@ -1027,9 +1027,8 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
         if sc is not None and school.items():
             it = school.pick(sc)
             if it:
-                img = school.image(it["id"])
                 log(f"학교 기출: {it['grade']}학년 {it['no']}번 냄")
-                return school.quiz(it), {"kb_images": [{"src": img, "alt": school.label(it)}] if img else []}
+                return school.quiz(it), {"kb_images": school.pictures(it)}  # 글은 카드에, 도형만 그림으로 (2026-11-26)
             return "그 조건에 맞는 학교 기출이 창고에 없어요. 지금 있는 시험: " + school.summary(), None
     asked, secs = think_request(text)
     think = bool(think or asked)

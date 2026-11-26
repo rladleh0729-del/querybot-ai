@@ -59,7 +59,7 @@ def items() -> list:
         if _st["err"] and now - _st["loaded"] < 300:
             return _st["items"]
         try:
-            rows = _q("SELECT id, school, grade, semester, term, year, no, kind, points, text, choices, answer, figure, solution FROM kb_school")
+            rows = _q("SELECT id, school, grade, semester, term, year, no, kind, points, text, choices, answer, figure, solution, full, (fig IS NOT NULL AND fig != '') AS has_fig FROM kb_school")
             for r in rows:
                 try:
                     r["choices"] = json.loads(r.get("choices") or "null")
@@ -73,19 +73,43 @@ def items() -> list:
     return _st["items"]
 
 
-def image(item_id: str) -> str:
-    """문항 그림 data URL (D1에서 그때 받음, 최근 40개는 기억)"""
-    if item_id in _imgs:
-        _imgs.move_to_end(item_id)
-        return _imgs[item_id]
-    rows = _q("SELECT img FROM kb_school WHERE id = ?", [item_id])
-    b64 = (rows[0].get("img") if rows else "") or ""
+def image(item_id: str, col: str = "img") -> str:
+    """문항 그림 data URL — col="img" 문항 전체(모델이 풀 때), "fig" 도형·그래프 부분만(사용자에게 보임). 최근 40개는 기억"""
+    col = "fig" if col == "fig" else "img"
+    ck = col + "|" + item_id
+    if ck in _imgs:
+        _imgs.move_to_end(ck)
+        return _imgs[ck]
+    rows = _q(f"SELECT {col} AS b FROM kb_school WHERE id = ?", [item_id])
+    b64 = (rows[0].get("b") if rows else "") or ""
     url = "data:image/jpeg;base64," + b64 if b64 else ""
     if url:
-        _imgs[item_id] = url
+        _imgs[ck] = url
         while len(_imgs) > 40:
             _imgs.popitem(last=False)
     return url
+
+
+def pictures(it) -> list:
+    """사용자에게 붙일 그림 (2026-11-26 사용자: '텍스트는 텍스트로, 이미지만 이미지 첨부로')
+    보기가 그림이거나 글을 못 뽑은 문항 → 문항 전체 그림(full: 페이지가 보기를 번호만 보여 줌), 도형이 있으면 그 부분만, 글뿐이면 없음"""
+    if it.get("full") or not (it.get("text") or "").strip():
+        src = image(it["id"], "img")
+        return [{"src": src, "alt": label(it), "full": True}] if src else []
+    if it.get("has_fig"):
+        src = image(it["id"], "fig")
+        return [{"src": src, "alt": label(it) + " 그림"}] if src else []
+    return []
+
+
+TEX_FIX = [(r"\overparen", r"\overgroup"), (r"\backsim", r"\sim"), (r"\fallingdotseq", r"\doteq")]  # KaTeX가 못 그리는 명령
+
+
+def _clean(s: str) -> str:
+    s = re.sub(r"^\s*\d{1,3}\s*[.)]\s*", "", (s or "").strip())  # 맨 앞 '13.'·'2)' 같은 번호
+    for a, b in TEX_FIX:
+        s = s.replace(a, b)  # 글자 그대로 바꿈(정규식 아님)
+    return s
 
 
 ASK = re.compile(r"(기출|시험\s?문제|내신|중간\s?고사|기말\s?고사|중간|기말)")
@@ -179,17 +203,22 @@ def quiz(it) -> str:
     ch = it.get("choices") or []
     ans = (it.get("answer") or "").strip()
     nums = _nums(ans) if ch else []
-    q = "위 문제를 풀고 답을 골라 보세요."
+    full = bool(it.get("full") or not (it.get("text") or "").strip())
+    q = "위 문제를 풀고 답을 골라 보세요." if full else _clean(it["text"])  # 그림이 문항 전체면 안내만, 아니면 문제 글 그대로
     if ch and len(nums) == 1:
-        card = {"q": q, "choices": [re.sub(r"^\s*[①②③④⑤⑥⑦⑧⑨]\s*", "", c) for c in ch], "answer": nums[0]}
+        card = {"q": q, "choices": [_clean(re.sub(r"^\s*[①②③④⑤⑥⑦⑧⑨]\s*", "", c)) for c in ch], "answer": nums[0]}
     elif ch and len(nums) > 1:
         a = ", ".join(str(n) for n in nums)
-        card = {"q": q + f" (정답 {len(nums)}개 — 번호를 쉼표로, 예: 1, 3)", "answer": a,
+        opts = "" if full else "\n\n" + "\n".join(_clean(c) for c in ch)  # 답이 여럿이면 단답 칸 카드라 보기를 글로 붙임
+        card = {"q": q + opts + f"\n\n(정답 {len(nums)}개 — 번호를 쉼표로, 예: 1, 3)", "answer": a,
                 "accept": [a.replace(" ", ""), " ".join(str(n) for n in nums), "".join(CIRCLED[n - 1] for n in nums), "".join(str(n) for n in nums)]}
     elif ans:
-        card = {"q": "위 문제의 답을 써 보세요.", "answer": ans, "accept": [ans.replace(" ", "")]}
+        bare = re.sub(r"[\s$]", "", ans)  # '$x=3$' → 'x=3', 그리고 '=' 오른쪽 '3'도 맞게
+        acc = [bare, bare.split("=")[-1]] if "=" in bare else [bare]
+        card = {"q": "위 문제의 답을 써 보세요." if full else q, "answer": ans.replace("$", "") if ans.count("$") == 2 and ans.startswith("$") else ans,
+                "accept": list(dict.fromkeys(a for a in acc if a))}
     else:
-        return head + "\n\n위 문제를 풀어 보세요. 다 풀면 답을 보내 주세요(이 문항은 정답표가 없어서 함께 확인해 볼게요)."
+        return head + ("" if full else "\n\n" + q) + "\n\n다 풀면 답을 보내 주세요(이 문항은 정답표가 없어서 함께 확인해 볼게요)."
     return head + "\n\n```quiz\n" + json.dumps(card, ensure_ascii=False) + "\n```"
 
 
