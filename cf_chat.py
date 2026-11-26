@@ -282,6 +282,13 @@ def _check_quiz(out: str, kb_hits: list) -> str:
     return QUIZ_BLOCK.sub(one, out)
 
 
+QUIZ_RESULT = re.compile(r"맞았어!|틀렸어\. 힌트 줘|퀴즈 \d+문제 다 풀었어|\bCorrect!|wrong\. Give me a hint|Finished all \d+ quiz", re.I)
+QUIZ_RESULT_NOTE = (
+    " 사용자가 방금 앞 답의 퀴즈를 풀고 결과를 알려 줬어(정답은 앞 답의 ```quiz JSON에 있어). "
+    "맞혔으면 한 줄로 칭찬하고, 핵심 풀이를 2~3줄로 짧게 짚은 뒤, 이어서 할 만한 것(비슷한 문제·한 단계 어려운 문제 등)을 한 줄로 물어봐. "
+    "틀려서 힌트를 달라고 하면 정답과 정답 번호는 절대 말하지 말고, 생각할 실마리 한 가지만 짧게 줘. "
+    "여러 문제 결과면 맞힌 수를 한 줄로 말하고 틀린 문제만 짧게 풀이해. 사용자가 원하기 전에는 새 퀴즈를 내지 마."
+)
 QUIZ_PROMPT = (
     " 퀴즈: 사용자가 문제를 내 달라고 하거나 직접 풀어 보겠다고 하면, 문제마다 ```quiz 한 줄로 시작해 JSON 하나를 쓰고 ``` 로 닫아 "
     "(화면에서 보기를 누르거나 답을 넣으면 바로 채점되는 카드가 되고, 정답은 숨겨져). "
@@ -1060,6 +1067,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
               + (FIN_PROMPT if want_fin else "")
               + (FILE_PROMPT if want_file else "")
               + (QUIZ_PROMPT if QUIZ_ASK.search(text or "") else "")  # 퀴즈 지시도 부탁할 때만 (2026-11-22)
+              + (QUIZ_RESULT_NOTE if QUIZ_RESULT.search(text or "") else "")  # 퀴즈 결과로 이어진 말 (2026-11-26)
               + " ---- 이번 대화 정보: " + f"오늘은 한국 시각으로 {today_kst()}이야." + wp)
     force_browser = bool(browser and BROWSER_FORCE.search(text or ""))
     if browser:
