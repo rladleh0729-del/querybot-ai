@@ -233,7 +233,8 @@ def _nums(ans: str) -> list:
 def quiz(it) -> str:
     """모델 없이 바로 낼 답: 문항 이름(다시 찾는 표시이기도 함) + 퀴즈 카드"""
     lv = it.get("level") if isinstance(it.get("level"), int) else 0
-    head = f"**{label(it)}**" + (f" · 난이도 {'★' * lv}{'☆' * (5 - lv)}" + (" 킬러" if lv >= 5 else "") if lv else "")
+    # 난이도는 글자로(사용자는 별·알약 장식을 싫어함, 2026-11-26 다른 세션이 전함): '난이도 5/5 · 킬러'
+    head = f"**{label(it)}**" + (f" · 난이도 {lv}/5" + (" · 킬러" if lv >= 5 else "") if lv else "")
     ch = it.get("choices") or []
     ans = (it.get("answer") or "").strip()
     nums = _nums(ans) if ch else []
