@@ -689,10 +689,7 @@ class SchoolImgIn(BaseModel):
 @app.post("/school/img")
 def school_img(body: SchoolImgIn, request: Request):
     # 저장된 대화를 다시 열면 학교 기출 문항 그림이 없음(그림은 대화 기록에 안 넣음) → 페이지가 문항 이름으로 다시 받음. 주인만 (2026-11-26)
-    check_rate_limit(client_ip(request))
-    c = read_session(body.s) if body.s else None
-    if not (c and c.get("o")):
-        raise HTTPException(status_code=403, detail="주인 계정으로 로그인했을 때만 볼 수 있어요")
+    check_rate_limit(client_ip(request))  # 2026-11-28 사용자 '전체 허용' → 주인 확인 없음
     it = school.find_label(body.label)
     pics = school.pictures(it) if it else []
     if not pics:

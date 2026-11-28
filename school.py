@@ -133,13 +133,18 @@ def want(text: str):
         return None
     if not re.search(r"학년|학기|중간|기말|내신|우리\s?학교|학교|이수중|중\s?[123]|기출", t):
         return None
+    return _cond(t)
+
+
+def _cond(t: str) -> dict:
+    """글에서 학년·학기·중간/기말·연도·종류·그림·난이도 조건"""
     c = {}
-    m = re.search(r"([123])\s*학년|중\s*([123])(?![\d])|(?<![\d])([123])\s*-\s*[12](?![\d])", t)  # '1-2' = 1학년 2학기
+    m = re.search(r"([123])\s*학년|중\s*([123])(?![\d])|(?<![\d])([123])\s*-\s*[12](?![\d])|학년\s*=\s*([123])", t)  # '1-2' = 1학년 2학기
     if m:
-        c["grade"] = int(m.group(1) or m.group(2) or m.group(3))
-    m = re.search(r"([12])\s*학기", t) or re.search(r"[123]\s*-\s*([12])", t)
+        c["grade"] = int(m.group(1) or m.group(2) or m.group(3) or m.group(4))
+    m = re.search(r"([12])\s*학기|학기\s*=\s*([12])", t) or re.search(r"[123]\s*-\s*([12])", t)
     if m:
-        c["semester"] = int(m.group(1))
+        c["semester"] = int(m.group(1) or (m.group(2) if m.re.groups > 1 else None))
     m = re.search(r"중간|기말", t)
     if m:
         c["term"] = m.group(0)
@@ -162,11 +167,35 @@ def level_word(t: str):
     """난이도 말 → 'killer'(5, 없으면 4) · 'hard'(4 이상) · 'easy'(2 이하) · None(말 없음 = 3 이상)"""
     if re.search(r"킬러|최고\s?난도|초\s?고난도|가장\s?어려|제일\s?어려", t):
         return "killer"
-    if re.search(r"고난도|어려운|어렵|심화|난이도\s?(높|상)|빡센|까다로", t):
+    if re.search(r"고난도|어려운|어려움|어렵|심화|난이도\s?(높|상)|빡센|까다로", t):
         return "hard"
-    if re.search(r"쉬운|쉽게|기본|기초|난이도\s?(낮|하)", t):
+    if re.search(r"쉬운|쉬움|쉽게|기본|기초|난이도\s?(낮|하)", t):
         return "easy"
     return None
+
+
+# 2026-11-28 사용자: "특정 기준 말고 그냥 모델이 스스로 판단은 못하나" → 말 규칙 대신 모델에게 도구를 주고 쓸지 말지 맡김
+TAG = re.compile(r"<<\s*school\s*:\s*(.*?)\s*>>", re.S | re.I)
+
+
+def prompt() -> str:
+    """주인 계정일 때만 지시문에 붙는 안내(창고에 있는 학교·시험 목록 포함)"""
+    its = items()
+    if not its:
+        return ""
+    name = its[0]["school"]
+    # 사이트는 공개라 '이 사용자는 그 학교 학생'이라고는 말하지 않음(주인의 학교가 드러나지 않게) — 창고에 그 학교 기출이 있다는 것만
+    return (f" (학교 기출 도구) 쿼리봇 창고에 {name} 수학 정기고사 기출(문항 그림·공식 정답)이 있어 — 있는 시험: {summary()}. "
+            f"사용자가 {name}·학교 시험·내신 기출 문제를 풀고 싶어 하거나 달라고 하면(말이 짧거나 '내줘'가 없어도, '하나 더'·'다음'·'아니 1학년 2학기'·'더 어려운 거'처럼 이어 말해도) "
+            "문제를 직접 만들거나 지어내지 말고 답 대신 한 줄로 <<school: 학년=1, 학기=2, 시험=기말, 연도=2024, 난이도=킬러>> 처럼만 써 "
+            "(난이도는 킬러·어려움·보통·쉬움, 종류=서술형도 됨). 칸에는 사용자가 말한 조건(또는 바로 앞 대화에서 정해진 조건)만 넣고, 말하지 않은 학년·학기·연도·시험은 비워 둬(서버가 그 안에서 골고루 고름). "
+            "'하나 더'는 앞 문제와 같은 학년·학기·난이도로. "
+            "기출 공부법·분석·일정처럼 문제를 원하는 게 아니면 쓰지 말고, 앞에서 낸 기출의 풀이·채점·힌트를 물으면 도구 없이 답해.")
+
+
+def from_tag(s: str) -> dict:
+    """<<school: …>> 안의 글 → 조건(빈 칸·'아무거나'는 무시)"""
+    return _cond(s or "")
 
 
 MORE = re.compile(r"^\s*(다음\s?(문제|거|꺼)?|하나\s?더|한\s?(문제|개)\s?더|또\s?(줘|내\s?줘|하나|내\s?봐)?|더\s?(줘|내\s?줘|풀래)|계속|next)\s*(줘|요|주세요)?\s*[!.?~]*\s*$", re.I)

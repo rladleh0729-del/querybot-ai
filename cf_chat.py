@@ -23,7 +23,9 @@ import web_search
 import wiki_search
 import kb  # 지식 창고: 평가원 수능 기출 (2026-11-22, 2026-11-24 전 영역)
 import finance  # 기업·주가 도구: 금융감독원 DART + 금융위원회 주식시세 (2026-11-24)
-import school  # 주인 전용 학교 내신 기출(문항 그림 그대로) (2026-11-26)
+import school  # 학교 내신 기출(문항 그림 그대로) (2026-11-26)
+# 2026-11-28 사용자: "쓰는 사람이 나밖에 없고 여러 폰으로 하는데 계정이 하나만 있는 게 아니니 그냥 전체 허용해" → 주인 로그인 확인 없이 모두에게
+SCHOOL_OPEN = True
 
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
@@ -85,7 +87,7 @@ SEARCH_TAG = re.compile(r"<<\s*search\s*:\s*(.+?)\s*>>", re.S | re.I)
 THINK_OPEN = r"<<\s*[^<>/:\n]{1,8}\s*>>"
 THINK_CLOSE = r"<<\s*/\s*[^<>:\n]{0,8}\s*>>"
 THINK_BLOCK = re.compile(THINK_OPEN + r"\s*(.*?)\s*" + THINK_CLOSE, re.S)  # 2026-11-11: 모델이 <<생약>>처럼 틀리게 쓰기도 함
-ANY_TAG = re.compile(r"<<\s*(calc|search|remember|weather|stock|company|market)\s*:.*?>>", re.S | re.I)
+ANY_TAG = re.compile(r"<<\s*(calc|search|remember|weather|stock|company|market|school)\s*:.*?>>", re.S | re.I)
 # 기업·주가 도구 (2026-11-24 사용자: "실시간 주가 조회랑 조언용 주식 데이터" → "DART·전일 주가부터"): 열쇠(DART_API_KEY·DATA_GO_KR_KEY)가 있고
 # 주식·회사 얘기일 때만 안내(뉴런 아끼기). 모델이 <<stock: 이름>>·<<company: 이름>>을 쓰면 finance.tool이 자료 글을 돌려줌
 STOCK_TAG = re.compile(r"<<\s*stock\s*:\s*(.+?)\s*>>", re.S | re.I)
@@ -1028,16 +1030,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
         text = text[:120000] + f"\n\n…(글이 너무 길어서 가운데 {cut:,}자는 빼고 보냄)…\n\n" + text[-80000:]
     # 주인 학교 기출 (2026-11-26 사용자: '그걸로 기출 내주라 하면 편하겠다'): 주인 계정일 때만, '1학년 기출 내줘' 같은 말이면
     # 모델 없이 바로 문항 그림 + 퀴즈 카드(정답은 카드 속에 숨김) — 빠르고 뉴런을 안 씀
-    if owner and not images and not files:
-        sc = school.want(text)
-        sc = school.more(text, history) if sc is None else sc
-        sc = school.fix(text, history) if sc is None else sc  # '아니 1학년 2학기'처럼 조건만 고쳐 말함 (2026-11-28)
-        if sc is not None and school.items():
-            it = school.pick(sc)
-            if it:
-                log(f"학교 기출: {it['grade']}학년 {it['no']}번 냄")
-                return school.quiz(it), {"kb_images": school.pictures(it)}  # 글은 카드에, 도형만 그림으로 (2026-11-26)
-            return "그 조건에 맞는 학교 기출이 창고에 없어요. 지금 있는 시험: " + school.summary(), None
+    # 2026-11-28 사용자: "특정 기준 말고 모델이 스스로 판단" → 말 규칙 대신 지시문에 학교 기출 도구(<<school: …>>)를 주고 모델이 쓸지 정함(아래)
     asked, secs = think_request(text)
     think = bool(think or asked)
     if think and not asked and SMALL_TALK.match(text or ""):  # 단추만 켜져 있고 인사·맞장구면 생각 없이 바로
@@ -1066,6 +1059,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     want_fin = finance.ready() and bool(FIN_ASK.search(text or "") or any(FIN_ASK.search(h.content[:300]) for h in history[-2:] if h.role == "user"))
     system = (SYSTEM_PROMPT + (CALC_PROMPT if USE_CALC else "") + (SEARCH_PROMPT if USE_SEARCH else "") + WEATHER_PROMPT + REMEMBER_PROMPT
               + (FIN_PROMPT if want_fin else "")
+              + (school.prompt() if SCHOOL_OPEN and not images and not files else "")  # 학교 기출 도구 (2026-11-28 모두에게)
               + (FILE_PROMPT if want_file else "")
               + (QUIZ_PROMPT if QUIZ_ASK.search(text or "") else "")  # 퀴즈 지시도 부탁할 때만 (2026-11-22)
               + (QUIZ_RESULT_NOTE if QUIZ_RESULT.search(text or "") else "")  # 퀴즈 결과로 이어진 말 (2026-11-26)
@@ -1158,7 +1152,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     # 지식 창고 (2026-11-22): 기출 번호를 말하면 답하기 전에 원문을 넣어 줌 — 인터넷 검색보다 정확하고 호출이 늘지 않음
     kb_hits = kb.lookup(text)
     # 앞에서 낸 학교 기출을 이어서 물으면(풀이·채점) 그 문항 그림과 공식 정답을 같이 줌 — 그림은 Gemma 4(Cloudflare)만 볼 수 있음
-    sref = school.ref(history) if owner else None
+    sref = school.ref(history) if SCHOOL_OPEN or owner else None
     if sref:
         msgs[0] = {"role": "system", "content": msgs[0]["content"] + " " + school.note(sref)}
         system_plain += " " + school.note(sref)
@@ -1238,6 +1232,15 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
                  {"role": "user", "content": "방금 생각한 것을 바탕으로 원래 말에 답해 줘. 생각 요약을 그대로 옮기지 말고, 원래 말에 대한 답을 해."}]
         d = _call(msgs)
         out = _finish(msgs, d, clean(d["choices"][0]["message"]["content"] or ""))
+    # 주인 학교 기출: 모델이 <<school: 학년=…, 난이도=…>>를 쓰면 창고에서 골라 그림 + 퀴즈 카드(공식 정답)로 바로 냄 — 모델이 문제를 지어내지 않게
+    msch = school.TAG.search(out) if SCHOOL_OPEN or owner else None
+    if msch:
+        cond = school.from_tag(msch.group(1))
+        it = school.pick(cond)
+        if it:
+            log(f"학교 기출(모델이 고름): {it['grade']}학년 {it['no']}번 · 조건 {cond}")
+            return school.quiz(it), {"kb_images": school.pictures(it)}
+        return "그 조건에 맞는 학교 기출이 창고에 없어요. 지금 있는 시험: " + school.summary(), None
     extra, calcs, searched, weathered, fins = {}, 0, False, False, 0
     if kb_hits:
         extra["sources"] = kb.sources(kb_hits)
