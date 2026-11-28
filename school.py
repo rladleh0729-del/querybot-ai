@@ -290,13 +290,10 @@ def quiz(it) -> str:
     nums = _nums(ans) if ch else []
     full = bool(it.get("full") or not (it.get("text") or "").strip())
     q = "위 문제를 풀고 답을 골라 보세요." if full else _clean(it["text"])  # 그림이 문항 전체면 안내만, 아니면 문제 글 그대로
-    if ch and len(nums) == 1:
-        card = {"q": q, "choices": [_clean(re.sub(r"^\s*[①②③④⑤⑥⑦⑧⑨]\s*", "", c)) for c in ch], "answer": nums[0]}
-    elif ch and len(nums) > 1:
-        a = ", ".join(str(n) for n in nums)
-        opts = "" if full else "\n\n" + "\n".join(_clean(c) for c in ch)  # 답이 여럿이면 단답 칸 카드라 보기를 글로 붙임
-        card = {"q": q + opts + f"\n\n(정답 {len(nums)}개 — 번호를 쉼표로, 예: 1, 3)", "answer": a,
-                "accept": [a.replace(" ", ""), " ".join(str(n) for n in nums), "".join(CIRCLED[n - 1] for n in nums), "".join(str(n) for n in nums)]}
+    if ch and nums:
+        # 답이 여럿이면 "answer": [2, 4] — 사이트 121차가 보기를 여러 개 눌러 고르게 함(2026-11-28 사용자 화면: 보기를 한 문단에 붙이고 '답' 칸에 쓰게 했음)
+        card = {"q": q, "choices": [_clean(re.sub(r"^\s*[①②③④⑤⑥⑦⑧⑨]\s*", "", c)) for c in ch],
+                "answer": nums[0] if len(nums) == 1 else nums}
     elif ans:
         bare = re.sub(r"[\s$]", "", ans)  # '$x=3$' → 'x=3', 그리고 '=' 오른쪽 '3'도 맞게
         acc = [bare, bare.split("=")[-1]] if "=" in bare else [bare]
