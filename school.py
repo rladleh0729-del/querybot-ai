@@ -120,14 +120,23 @@ NOT_SCHOOL = re.compile(r"수능|평가원|모의\s?고사|모의\s?평가|학�
 def want(text: str):
     """학교 기출을 달라는 말이면 조건 dict, 아니면 None"""
     t = text or ""
-    if NOT_SCHOOL.search(t) or not ASK.search(t) or not GIVE.search(t) or len(t) > 120:
+    if NOT_SCHOOL.search(t) or not ASK.search(t) or len(t) > 120:
         return None
-    if not re.search(r"학년|학기|중간|기말|내신|우리\s?학교|학교|중\s?[123]|기출", t):
+    # 2026-11-28 사용자 기록: '이수중 기출 1-2'·'이수중 기출 수학 킬러'·'이수중 2학년 2학기 기말고사 기출 문제'처럼 '내줘'가 없으면
+    # 못 알아들어 모델이 '파일이 없다'·웹 검색·지어낸 문제로 답함 → 학교 이름이나 학년·학기·난이도를 말하면 요청 말이 없어도 냄
+    named = bool(re.search(r"이수중|우리\s?학교|내\s?학교|학교\s?기출|내신", t))
+    detail = bool(re.search(r"[123]\s*학년|[12]\s*학기|중\s*[123](?!\d)|[123]\s*-\s*[12](?!\d)|중간|기말|킬러|고난도|어려운|쉬운", t))
+    if not (GIVE.search(t) or named or (detail and "기출" in t)):
+        return None
+    # 방법·일정·분석을 묻는 말('기출 공부법 알려줘', '이수중 기출 유형 분석해 줘')은 문제를 내지 않고 모델이 답함 — '문제 내 줘'라고 하면 냄
+    if re.search(r"공부법|공부\s?방법|방법|어떻게|팁|분석|유형|경향|정리해|설명해|언제|어디서|일정|범위|사이트|구하", t) and             not re.search(r"내\s?줘|내\s?주|문제\s?(줘|하나|내)|풀래|풀고\s?싶|출제", t):
+        return None
+    if not re.search(r"학년|학기|중간|기말|내신|우리\s?학교|학교|이수중|중\s?[123]|기출", t):
         return None
     c = {}
-    m = re.search(r"([123])\s*학년|중\s*([123])(?![\d])", t)
+    m = re.search(r"([123])\s*학년|중\s*([123])(?![\d])|(?<![\d])([123])\s*-\s*[12](?![\d])", t)  # '1-2' = 1학년 2학기
     if m:
-        c["grade"] = int(m.group(1) or m.group(2))
+        c["grade"] = int(m.group(1) or m.group(2) or m.group(3))
     m = re.search(r"([12])\s*학기", t) or re.search(r"[123]\s*-\s*([12])", t)
     if m:
         c["semester"] = int(m.group(1))
@@ -161,6 +170,18 @@ def level_word(t: str):
 
 
 MORE = re.compile(r"^\s*(다음\s?(문제|거|꺼)?|하나\s?더|한\s?(문제|개)\s?더|또\s?(줘|내\s?줘|하나|내\s?봐)?|더\s?(줘|내\s?줘|풀래)|계속|next)\s*(줘|요|주세요)?\s*[!.?~]*\s*$", re.I)
+
+
+def fix(text: str, history: list):
+    """바로 앞 답이 학교 기출(또는 바로 앞 사용자 말이 학교 기출 부탁)일 때 '아니 1학년 2학기'·'킬러로'처럼 조건만 말하면 그 조건"""
+    t = text or ""
+    if len(t) > 60 or not re.search(r"[123]\s*학년|[12]\s*학기|[123]\s*-\s*[12](?!\d)|중간|기말|킬러|고난도|어려운|쉬운|서술|객관식", t):
+        return None
+    prev_user = next(((h.content if hasattr(h, "content") else h.get("content", "")) for h in reversed(history[-4:])
+                      if (h.role if hasattr(h, "role") else h.get("role")) == "user"), "")
+    if not (ref(history) or want(prev_user) is not None):
+        return None
+    return want("이수중 기출 " + t)
 
 
 def more(text: str, history: list):

@@ -1031,6 +1031,7 @@ def _reply(text: str, history: list, images=None, files=None, think: bool = Fals
     if owner and not images and not files:
         sc = school.want(text)
         sc = school.more(text, history) if sc is None else sc
+        sc = school.fix(text, history) if sc is None else sc  # '아니 1학년 2학기'처럼 조건만 고쳐 말함 (2026-11-28)
         if sc is not None and school.items():
             it = school.pick(sc)
             if it:
